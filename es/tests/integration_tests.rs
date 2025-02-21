@@ -19,11 +19,11 @@ struct BankAccountStream {
     pub balance: f64,
 }
 
-// create bank account events enum: Deposit and Withdraw
+// create bank account events enum: Deposited and Withdrawn
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
 enum BankAccountEvent {
-    Deposit { amount: f64 },
-    Withdraw { amount: f64 },
+    Deposited { amount: f64 },
+    Withdrawn { amount: f64 },
 }
 
 // bank account urn
@@ -47,10 +47,10 @@ impl replay::Stream for BankAccountStream {
 
     fn apply(&mut self, event: Self::Event) {
         match event {
-            BankAccountEvent::Deposit { amount } => {
+            BankAccountEvent::Deposited { amount } => {
                 self.balance += amount;
             }
-            BankAccountEvent::Withdraw { amount } => {
+            BankAccountEvent::Withdrawn { amount } => {
                 self.balance -= amount;
             }
         }
@@ -87,15 +87,15 @@ async fn bank_account_postgres_test() {
 
     let store = replay::persistence::PostgresEventStore::new(pg_pool);
 
-    let stream_id = UrnBuilder::new("bank-account", "1").build().unwrap();
+    let stream_id = BankAccountUrn(UrnBuilder::new("bank-account", "1").build().unwrap());
 
     let events = vec![
-        BankAccountEvent::Deposit { amount: 100.0 },
-        BankAccountEvent::Withdraw { amount: 40.0 },
+        BankAccountEvent::Deposited { amount: 100.0 },
+        BankAccountEvent::Withdrawn { amount: 40.0 },
     ];
 
     store
-        .store_events(
+        .store_events::<BankAccountStream>(
             &stream_id,
             "BankAccount".to_string(),
             replay::Metadata::default(),
@@ -106,7 +106,9 @@ async fn bank_account_postgres_test() {
         .unwrap();
 
     let stream_events = store
-        .stream_events::<BankAccountEvent>(StreamFilter::WithStreamId(stream_id))
+        .stream_events::<BankAccountEvent>(StreamFilter::with_stream_id::<BankAccountStream>(
+            &stream_id,
+        ))
         .map_ok(|persisted_event| persisted_event.data)
         .try_collect::<Vec<_>>()
         .await
