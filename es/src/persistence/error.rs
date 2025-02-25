@@ -2,7 +2,7 @@ use thiserror::Error;
 use urn::Urn;
 
 #[derive(Debug, Error)]
-pub enum EventStoreError {
+pub enum    EventStoreError {
     #[error("Serialization error: {0}")]
     Serialization(anyhow::Error),
     #[error("Deserialization error: {0}")]
