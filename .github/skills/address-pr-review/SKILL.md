@@ -1,6 +1,6 @@
 ---
 name: address-pr-review
-description: 'Review and resolve open review feedback on a pull request against its upstream repository, then keep the branch in sync without rewriting history. Use when asked to "review my PR", address PR/review comments, respond to reviewer feedback, resolve review threads, or sync a feature branch with upstream before review. Covers: resolving the upstream remote (from git remote -v when not configured), challenging vs. fixing each comment, replying to and resolving threads with gh, and detecting/handling a branch that is behind upstream main (conflict check, user confirmation, no force-push).'
+description: 'Review and resolve open review feedback on a pull request against its upstream repository, then keep the branch in sync without rewriting history. Use when asked to "review my PR", address PR/review comments, respond to reviewer feedback, resolve review threads, or sync a feature branch with upstream before review. Covers: resolving the upstream remote (from git remote -v when not configured), verifying the PR is linked to a closing issue (and finding a similarly-named issue when it is not), challenging vs. fixing each comment, replying to and resolving threads with gh, and detecting/handling a branch that is behind upstream main (conflict check, user confirmation, no force-push).'
 ---
 
 # Address PR Review
@@ -71,7 +71,52 @@ gh pr view <number> --json title,body,files,commits
    ```
    On "no", leave the PR untouched and continue.
 
-## 2. Collect open review comments
+## 2. Confirm the PR is linked to a closing issue
+The convention is **one PR linked to one issue**. The link must use a GitHub
+[closing keyword](https://docs.github.com/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue)
+(`Closes #N`, `Fixes #N`, `Resolves #N`) so the issue auto-closes on merge.
+
+1. **Detect an existing link.** Inspect the PR body (and the linked-issue field)
+   for a closing keyword:
+   ```bash
+   gh pr view <number> --json body,closingIssuesReferences
+   ```
+   `closingIssuesReferences` is populated when GitHub recognises a link. If it is
+   non-empty, the PR is linked — note the issue number(s) and continue to step 3.
+2. **If NOT linked, search for a similar issue.** Use the PR title/branch and the
+   diff's intent as search terms against the upstream repo's open issues:
+   ```bash
+   gh issue list --repo <owner>/<repo> --state open --limit 50 \
+     --json number,title,url
+   # or a targeted search:
+   gh search issues --repo <owner>/<repo> --state open "<keywords from PR title>"
+   ```
+   Then present findings and guide the user toward the **one PR ↔ one issue** goal:
+   - **A clear match exists** — propose linking it. On the user's yes, add a closing
+     keyword to the PR body (keep existing content; append a line) and confirm
+     before editing:
+     ```bash
+     gh pr edit <number> --body-file <updated-body-file>   # body now contains "Closes #N"
+     ```
+   - **Multiple plausible matches** — list them (number, title, url) and **ask the
+     user which one** the PR closes before editing anything.
+   - **No matching issue exists** — explain that the convention expects a tracking
+     issue, and **ask the user** whether to (a) create one for this PR, or
+     (b) intentionally proceed without a linked issue. Only create an issue on
+     explicit confirmation:
+     ```bash
+     gh issue create --repo <owner>/<repo> --title "<title>" --body "<summary>"
+     # then link it:
+     gh pr edit <number> --body-file <updated-body-file>   # append "Closes #N"
+     ```
+3. **Never link more than one issue** unless the user explicitly wants it. If the
+   PR already closes multiple issues, flag it as a possible scope problem and ask
+   whether the work should be split.
+4. **Confirm before any edit.** As with the title/description, show the proposed
+   body change and wait for an explicit yes/no before running `gh pr edit` or
+   `gh issue create`.
+
+## 3. Collect open review comments
 Pull the unresolved review threads for the PR (use the upstream repo with
 `gh pr view` / `gh api`). Focus only on threads that are still **open/unresolved**.
 
@@ -81,7 +126,7 @@ gh pr view <number> --json reviews,comments
 gh api graphql -f query='...reviewThreads(isResolved){...}'   # filter isResolved == false
 ```
 
-## 3. Process each open comment
+## 4. Process each open comment
 For every open comment, iterate one at a time:
 
 1. **Challenge when warranted.** If the comment seems incorrect, unnecessary, or in
@@ -107,7 +152,7 @@ For every open comment, iterate one at a time:
    Leave a thread open (reply only, no resolve) when it is still blocked on user
    clarification or remains a point of disagreement.
 
-## 4. Check whether the branch is behind upstream
+## 5. Check whether the branch is behind upstream
 Fetch and compare the PR branch against the upstream default branch (commonly
 `main`):
 
@@ -127,19 +172,19 @@ git merge --no-commit --no-ff <upstream-remote>/<default-branch>
 git merge --abort   # if you only wanted to test for conflicts
 ```
 
-### 4a. Conflicts exist
+### 5a. Conflicts exist
 - **Ask the user** whether they want to update the branch and resolve the conflicts
   before continuing the review.
 - Only proceed to merge + resolve conflicts after the user confirms.
 
-### 4b. No conflicts
+### 5b. No conflicts
 - **Notify the user** that the branch is behind but conflict-free, then sync it by
   merging upstream into the branch (a merge commit, not a rebase):
   ```bash
   git merge <upstream-remote>/<default-branch>
   ```
 
-## 5. Push updates (no force)
+## 6. Push updates (no force)
 Push all new work — fixes from review and any sync merge commit — as ordinary,
 additive commits:
 
@@ -154,6 +199,8 @@ and ask the user instead.
 - The PR title follows Conventional Commits and the description satisfies the repo's
   template/guidelines and matches the actual code (with any edits confirmed by the
   user beforehand).
+- The PR is linked to exactly one closing issue, or the user has explicitly chosen
+  to proceed without one (any new link/issue confirmed by the user beforehand).
 - Every open review thread has a `gh` reply stating the action taken, and resolvable
   threads are marked resolved.
 - The branch is either in sync with upstream or the user has explicitly chosen to
