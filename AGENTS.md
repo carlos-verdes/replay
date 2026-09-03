@@ -48,6 +48,11 @@ or before any PR exists for it.
 
 ## Agent skills
 
+The skills themselves are vendored in `.github/skills/` so they travel with the repo
+and are picked up by the GitHub Copilot coding agent — no machine-local install
+needed. See `.github/skills/README.md`. They read their per-repo configuration from
+the files below.
+
 ### Issue tracker
 
 Issues live in GitHub Issues on the `upstream` repo `funkode-io/replay`; the `origin`
