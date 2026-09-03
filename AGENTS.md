@@ -45,3 +45,21 @@ Rules while a PR is under review:
 
 The only time history may be rewritten is before a branch has ever been pushed
 or before any PR exists for it.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues on the `upstream` repo `funkode-io/replay`; the `origin`
+fork `carlos-verdes/replay` has issues disabled, so every `gh` call needs an explicit
+`--repo funkode-io/replay`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` and one `docs/adr/` at the repo root, shared by all
+workspace crates. See `docs/agents/domain.md`.
