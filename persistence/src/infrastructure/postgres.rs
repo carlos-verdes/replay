@@ -358,7 +358,9 @@ impl PostgresEventStoreBuilder {
     /// **Concurrent appends are not replayed.** An event committed after that snapshot is
     /// outside the rebuild, and nothing applies it afterwards — inline projections run on
     /// append and on rebuild only — so the version is recorded with that event missing from
-    /// the view. This predates the chunked replay; see
+    /// the view. This predates the chunked replay, and needs another process to be
+    /// appending during startup: quiesce writers when bumping a projection version. Judged
+    /// too narrow to fix in
     /// [issue #162](https://github.com/funkode-io/replay/issues/162).
     pub async fn build(self) -> Result<PostgresEventStore, replay::Error> {
         // The same tunable that bounds an append's flush bounds a rebuild's replay: both
