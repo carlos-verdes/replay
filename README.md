@@ -3196,3 +3196,24 @@ gone, along with the `REPLAY_BLOCKED_WARN_AFTER_SECS` knob that paced it.
 
 A caught-up idle policy logs nothing at all.
 
+
+## Domain map
+
+`es-replay-map` draws a domain as an event-storming map: one group per aggregate holding its commands and events, an edge from each command to the events its `handle` arm builds, and `event → policy → command` for every command-issuing `react` arm. It writes one Mermaid flowchart, which GitHub renders in place.
+
+```sh
+cargo install es-replay-map
+cargo replay-map --src crates/domain/src --out docs/domain-map.md
+```
+
+`--src` is repeatable and defaults to `src`, and `--out` defaults to `docs/domain-map.md`. Run it with `--check` in CI: it writes nothing, and fails when the committed map differs from what the source generates. Pin the version you install (`--version =X.Y.Z`), because a new release may draw the same domain differently.
+
+The map is read from source with `syn`, not from anything the macros expand to, since which command yields which event exists only in the match arms. So it asks one thing of the domain: each `handle` and `react` arm builds its events or commands inline, in result position, never through a helper call.
+
+| Where | Built as |
+| --- | --- |
+| `Aggregate::handle` | `Ok(vec![BankAccountEvent::Deposited { .. }])`, `Vec::new()` or `Err(..)` |
+| `AggregatePolicy::react` | `vec![(urn, BankAccountCommand::Freeze)]`, or a `.map` to such a pair |
+| `Policy::react` | `vec![Dispatch::to::<BankAccount>(urn, BankAccountCommand::Freeze)]`, optionally `.with_metadata(..)` |
+
+A policy whose `Event` is a `query_events!` wrapper matches each event as `Wrapper::BankAccountEvent(BankAccountEvent::Deposited { .. })`. A `_` arm may only issue nothing. An arm the map cannot read fails the run with its `file:line`. Nothing is skipped silently.
