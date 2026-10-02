@@ -31,11 +31,11 @@ use quote::ToTokens;
 use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
+use syn::token;
 use syn::visit::{self, Visit};
 use syn::{
     braced, bracketed, Attribute, Block, Expr, ExprClosure, ExprMatch, ExprReturn, GenericArgument,
     Generics, Ident, ImplItem, Item, ItemImpl, Macro, Meta, Pat, PathArguments, Stmt, Token, Type,
-    Variant,
 };
 
 /// A domain construct the generator cannot read, at the place it met it.
@@ -522,9 +522,9 @@ fn snippet(tokens: &impl ToTokens) -> String {
     }
 }
 
-/// `Name<Generics> { key: value, .. }`, where `commands` and `events` are braced lists of enum variants and every other
-/// value (`namespace`, `state`, `service: FileService + LogService { .. }`) runs to the next top-level comma and is
-/// ignored, as are the generics.
+/// `Name<Generics> { key: value .. }`, where `commands` and `events` are braced lists of variants and every other value
+/// (`namespace`, `state`, `service: FileService + LogService { .. }`) runs to the next section and is ignored, as are
+/// the generics.
 fn aggregate(file: &str, mac: &Macro) -> Result<Located<AggregateDef>> {
     let parser = |input: ParseStream| -> syn::Result<AggregateDef> {
         let name: Ident = input.parse()?;
@@ -536,7 +536,9 @@ fn aggregate(file: &str, mac: &Macro) -> Result<Located<AggregateDef>> {
             let key: Ident = body.parse()?;
             body.parse::<Token![:]>()?;
             let mut value = Vec::new();
-            while !body.is_empty() && !body.peek(Token![,]) {
+            // `define_aggregate!` makes the comma between sections optional, so a value also ends where the next
+            // `key:` starts.
+            while !body.is_empty() && !body.peek(Token![,]) && !next_section(&body) {
                 value.push(body.parse::<TokenTree>()?);
             }
             let slot = match key.to_string().as_str() {
@@ -549,16 +551,9 @@ fn aggregate(file: &str, mac: &Macro) -> Result<Located<AggregateDef>> {
                     [TokenTree::Group(group)] if group.delimiter() == Delimiter::Brace => group,
                     _ => return Err(syn::Error::new(key.span(), format!("`{key}: {{ .. }}`"))),
                 };
-                let variants =
-                    Punctuated::<Variant, Token![,]>::parse_terminated.parse2(group.stream())?;
-                *slot = Some(
-                    variants
-                        .iter()
-                        .map(|v| v.ident.to_string())
-                        .collect::<Vec<_>>(),
-                );
+                *slot = Some(variant_names.parse2(group.stream())?);
             }
-            if !body.is_empty() {
+            if body.peek(Token![,]) {
                 body.parse::<Token![,]>()?;
             }
         }
@@ -578,6 +573,28 @@ fn aggregate(file: &str, mac: &Macro) -> Result<Located<AggregateDef>> {
         )
     })?;
     Ok(Located::at(file, mac.path.span(), def))
+}
+
+fn next_section(input: ParseStream) -> bool {
+    input.peek(Ident) && input.peek2(Token![:]) && !input.peek2(Token![::])
+}
+
+/// The variant names of a `commands` or `events` block, read as `define_aggregate!` reads them: commas between
+/// variants are optional, and each name may carry a braced (or parenthesised) payload the map ignores.
+fn variant_names(input: ParseStream) -> syn::Result<Vec<String>> {
+    let mut names = Vec::new();
+    while !input.is_empty() {
+        Attribute::parse_outer(input)?;
+        let name: Ident = input.parse()?;
+        if input.peek(token::Brace) || input.peek(token::Paren) {
+            input.parse::<TokenTree>()?;
+        }
+        if input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+        }
+        names.push(name.to_string());
+    }
+    Ok(names)
 }
 
 /// `Name => [AEvent, BEvent]`.
@@ -1463,6 +1480,37 @@ impl Policy for Echo {
                 refs(&[("DomainEvent", "Recorded")]),
                 refs(&[("DomainEvent", "Record")])
             )]
+        );
+    }
+
+    #[test]
+    fn an_aggregate_written_without_separating_commas_is_read() {
+        let bare = r#"
+define_aggregate! {
+    Lamp {
+        namespace: "lamp"
+        state: { on: bool }
+        commands: { TurnOn TurnOff { reason: String } }
+        events: { TurnedOn TurnedOff { reason: String } }
+    }
+}
+
+impl Aggregate for Lamp {
+    async fn handle(&self, command: Self::Command, _: &()) -> R {
+        match command {
+            LampCommand::TurnOn => Ok(vec![LampEvent::TurnedOn]),
+            LampCommand::TurnOff { reason } => Ok(vec![LampEvent::TurnedOff { reason }]),
+        }
+    }
+}
+"#;
+
+        let map = read_all(&[("lamp.rs", bare)]).unwrap();
+
+        assert_eq!(map.aggregates[0].commands, ["TurnOn", "TurnOff"]);
+        assert_eq!(
+            map.aggregates[0].decisions,
+            refs(&[("TurnOn", "TurnedOn"), ("TurnOff", "TurnedOff")])
         );
     }
 
