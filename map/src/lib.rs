@@ -799,7 +799,10 @@ fn variants(
                     if t.elems.len() == 1 && members.contains(&member) =>
                 {
                     let inner = Matched::Enum {
-                        aggregate: member.trim_end_matches("Event").to_owned(),
+                        aggregate: member
+                            .strip_suffix("Event")
+                            .unwrap_or(member.as_str())
+                            .to_owned(),
                         kind: Kind::Event,
                     };
                     return variants(file, &t.elems[0], &inner, out, wildcard);
@@ -1352,10 +1355,10 @@ impl Policy for Housekeeping {
     fn names_joined_by_an_underscore_still_get_distinct_nodes() {
         let source = |aggregate: &str, command: &str| {
             format!(
-                "define_aggregate! {{ {aggregate} {{ commands: {{ {command} }}, events: {{ Done }} }} }}
+                "define_aggregate! {{ {aggregate} {{ commands: {{ {command} }}, events: {{ {command} }} }} }}
                  impl Aggregate for {aggregate} {{
                      async fn handle(&self, c: Self::Command, _: &()) -> R {{
-                         match c {{ {aggregate}Command::{command} => Ok(vec![{aggregate}Event::Done]) }}
+                         match c {{ {aggregate}Command::{command} => Ok(vec![{aggregate}Event::{command}]) }}
                      }}
                  }}"
             )
@@ -1368,6 +1371,8 @@ impl Policy for Housekeeping {
 
         assert!(markdown.contains("cmd-A_B-C("));
         assert!(markdown.contains("cmd-A-B_C("));
+        assert!(markdown.contains("evt-A_B-C("));
+        assert!(markdown.contains("evt-A-B_C("));
     }
 
     #[test]
@@ -1413,6 +1418,52 @@ mod tests {
 "#;
 
         assert!(read_all(&[("cabinet.rs", CABINET), ("tests.rs", tests)]).is_ok());
+    }
+
+    #[test]
+    fn a_wrapped_event_type_loses_one_event_suffix_only() {
+        let source = r#"
+define_aggregate! {
+    DomainEvent {
+        commands: { Record },
+        events: { Recorded }
+    }
+}
+
+impl Aggregate for DomainEvent {
+    async fn handle(&self, command: Self::Command, _: &()) -> R {
+        match command {
+            DomainEventCommand::Record => Ok(vec![DomainEventEvent::Recorded]),
+        }
+    }
+}
+
+query_events!(Journal => [DomainEventEvent]);
+
+pub struct Echo;
+
+impl Policy for Echo {
+    type Event = Journal;
+
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<Dispatch> {
+        match &event.data {
+            Journal::DomainEventEvent(DomainEventEvent::Recorded) => {
+                vec![Dispatch::to::<DomainEvent>(id(), DomainEventCommand::Record)]
+            }
+        }
+    }
+}
+"#;
+
+        let map = read_all(&[("domain_event.rs", source)]).unwrap();
+
+        assert_eq!(
+            map.policies[0].reactions,
+            [(
+                refs(&[("DomainEvent", "Recorded")]),
+                refs(&[("DomainEvent", "Record")])
+            )]
+        );
     }
 
     #[test]
