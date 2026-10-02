@@ -34,7 +34,8 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
     braced, bracketed, Attribute, Block, Expr, ExprClosure, ExprMatch, ExprReturn, GenericArgument,
-    Ident, ImplItem, Item, ItemImpl, Macro, Pat, PathArguments, Stmt, Token, Type, Variant,
+    Generics, Ident, ImplItem, Item, ItemImpl, Macro, Meta, Pat, PathArguments, Stmt, Token, Type,
+    Variant,
 };
 
 /// A domain construct the generator cannot read, at the place it met it.
@@ -161,7 +162,8 @@ impl DomainMap {
         // Writing to a `String` cannot fail.
         for aggregate in &self.aggregates {
             let name = &aggregate.name;
-            let _ = writeln!(out, "\n    subgraph agg_{name} [{name}]");
+            let group = node_id("agg", &[name]);
+            let _ = writeln!(out, "\n    subgraph {group} [{name}]");
             for command in &aggregate.commands {
                 let _ = writeln!(
                     out,
@@ -179,7 +181,7 @@ impl DomainMap {
             let _ = writeln!(out, "    end");
             let _ = writeln!(
                 out,
-                "    style agg_{name} fill:#eedc92,stroke:#8f7d33,color:#000"
+                "    style {group} fill:#eedc92,stroke:#8f7d33,color:#000"
             );
             for (command, event) in &aggregate.decisions {
                 let _ = writeln!(
@@ -192,7 +194,7 @@ impl DomainMap {
         }
         for policy in &self.policies {
             for (index, (events, commands)) in policy.reactions.iter().enumerate() {
-                let node = format!("pol_{}_{index}", policy.name);
+                let node = node_id("pol", &[&policy.name, &index.to_string()]);
                 let _ = writeln!(out, "\n    {node}(\"{}\"):::policy", policy.name);
                 for (aggregate, event) in events {
                     let _ = writeln!(out, "    {} --> {node}", event_id(aggregate, event));
@@ -208,11 +210,21 @@ impl DomainMap {
 }
 
 fn command_id(aggregate: &str, command: &str) -> String {
-    format!("cmd_{aggregate}_{command}")
+    node_id("cmd", &[aggregate, command])
 }
 
 fn event_id(aggregate: &str, event: &str) -> String {
-    format!("evt_{aggregate}_{event}")
+    node_id("evt", &[aggregate, event])
+}
+
+/// Joined with `-`, which no Rust identifier contains, so two different name pairs never share a node: `_` would
+/// make aggregate `A_B` with command `C` collide with aggregate `A` and command `B_C`. A raw identifier drops its
+/// `r#`, which Mermaid cannot read.
+fn node_id(kind: &str, names: &[&str]) -> String {
+    std::iter::once(kind)
+        .chain(names.iter().map(|name| name.trim_start_matches("r#")))
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 struct Located<T> {
@@ -480,13 +492,19 @@ fn error(file: &str, span: Span, message: String) -> MapError {
     }
 }
 
+/// `#[cfg(test)]`, or any `cfg` that holds only under test, such as `#[cfg(all(test, not(target_arch = "wasm32")))]`.
 fn is_test(attrs: &[Attribute]) -> bool {
+    fn test_only(meta: &Meta) -> bool {
+        match meta {
+            Meta::Path(path) => path.is_ident("test"),
+            Meta::List(list) if list.path.is_ident("all") => list
+                .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                .is_ok_and(|all| all.iter().any(test_only)),
+            _ => false,
+        }
+    }
     attrs.iter().any(|attr| {
-        attr.path().is_ident("cfg")
-            && attr
-                .meta
-                .require_list()
-                .is_ok_and(|list| list.tokens.to_string() == "test")
+        attr.path().is_ident("cfg") && attr.parse_args::<Meta>().is_ok_and(|meta| test_only(&meta))
     })
 }
 
@@ -504,30 +522,33 @@ fn snippet(tokens: &impl ToTokens) -> String {
     }
 }
 
-/// `Name { key: value, .. }`, where `commands` and `events` are braced lists of enum variants and every other value
-/// (`namespace`, `state`) is one token tree the map ignores.
+/// `Name<Generics> { key: value, .. }`, where `commands` and `events` are braced lists of enum variants and every other
+/// value (`namespace`, `state`, `service: FileService + LogService { .. }`) runs to the next top-level comma and is
+/// ignored, as are the generics.
 fn aggregate(file: &str, mac: &Macro) -> Result<Located<AggregateDef>> {
     let parser = |input: ParseStream| -> syn::Result<AggregateDef> {
         let name: Ident = input.parse()?;
+        input.parse::<Generics>()?;
         let body;
         braced!(body in input);
         let (mut commands, mut events) = (None, None);
         while !body.is_empty() {
             let key: Ident = body.parse()?;
             body.parse::<Token![:]>()?;
-            let value: TokenTree = body.parse()?;
+            let mut value = Vec::new();
+            while !body.is_empty() && !body.peek(Token![,]) {
+                value.push(body.parse::<TokenTree>()?);
+            }
             let slot = match key.to_string().as_str() {
                 "commands" => Some(&mut commands),
                 "events" => Some(&mut events),
                 _ => None,
             };
             if let Some(slot) = slot {
-                let TokenTree::Group(group) = value else {
-                    return Err(syn::Error::new(key.span(), format!("`{key}: {{ .. }}`")));
+                let group = match value.as_slice() {
+                    [TokenTree::Group(group)] if group.delimiter() == Delimiter::Brace => group,
+                    _ => return Err(syn::Error::new(key.span(), format!("`{key}: {{ .. }}`"))),
                 };
-                if group.delimiter() != Delimiter::Brace {
-                    return Err(syn::Error::new(key.span(), format!("`{key}: {{ .. }}`")));
-                }
                 let variants =
                     Punctuated::<Variant, Token![,]>::parse_terminated.parse2(group.stream())?;
                 *slot = Some(
@@ -1328,13 +1349,80 @@ impl Policy for Housekeeping {
     }
 
     #[test]
+    fn names_joined_by_an_underscore_still_get_distinct_nodes() {
+        let source = |aggregate: &str, command: &str| {
+            format!(
+                "define_aggregate! {{ {aggregate} {{ commands: {{ {command} }}, events: {{ Done }} }} }}
+                 impl Aggregate for {aggregate} {{
+                     async fn handle(&self, c: Self::Command, _: &()) -> R {{
+                         match c {{ {aggregate}Command::{command} => Ok(vec![{aggregate}Event::Done]) }}
+                     }}
+                 }}"
+            )
+        };
+        let (a_b, a) = (source("A_B", "C"), source("A", "B_C"));
+
+        let markdown = read_all(&[("a_b.rs", &a_b), ("a.rs", &a)])
+            .unwrap()
+            .to_markdown();
+
+        assert!(markdown.contains("cmd-A_B-C("));
+        assert!(markdown.contains("cmd-A-B_C("));
+    }
+
+    #[test]
+    fn an_aggregate_with_generics_and_service_sections_is_read() {
+        let generic = r#"
+define_aggregate! {
+    FileManager<T: PartialEq> {
+        state: { processed: T },
+        commands: { ProcessFile { data: T } },
+        events: { FileProcessed { data: T } },
+        service: FileService + LogService {
+            fn validate(entry: &str) -> bool;
+        }
+    }
+}
+
+impl<T: PartialEq> Aggregate for FileManager<T> {
+    async fn handle(&self, command: Self::Command, _: &Self::Services) -> R {
+        match command {
+            FileManagerCommand::ProcessFile { data } => Ok(vec![FileManagerEvent::FileProcessed { data }]),
+        }
+    }
+}
+"#;
+
+        let map = read_all(&[("file_manager.rs", generic)]).unwrap();
+
+        assert_eq!(
+            map.aggregates[0].decisions,
+            refs(&[("ProcessFile", "FileProcessed")])
+        );
+    }
+
+    #[test]
+    fn a_module_compiled_only_under_test_is_skipped_however_its_cfg_is_spelled() {
+        let tests = r#"
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    impl Aggregate for OnlyInTests {
+        async fn handle(&self) -> R { helper() }
+    }
+}
+"#;
+
+        assert!(read_all(&[("cabinet.rs", CABINET), ("tests.rs", tests)]).is_ok());
+    }
+
+    #[test]
     fn the_map_draws_each_event_once_and_never_the_state() {
         let markdown = read(DRAWER, POLICY).unwrap().to_markdown();
 
-        assert_eq!(markdown.matches("evt_Drawer_Locked(").count(), 1);
-        assert!(markdown.contains("subgraph agg_Drawer [Drawer]"));
-        assert!(markdown.contains("evt_Cabinet_Sealed --> pol_DrawerPolicy_1"));
-        assert!(markdown.contains("pol_DrawerPolicy_1 --> cmd_Drawer_Lock"));
+        assert_eq!(markdown.matches("evt-Drawer-Locked(").count(), 1);
+        assert!(markdown.contains("subgraph agg-Drawer [Drawer]"));
+        assert!(markdown.contains("evt-Cabinet-Sealed --> pol-DrawerPolicy-1"));
+        assert!(markdown.contains("pol-DrawerPolicy-1 --> cmd-Drawer-Lock"));
         assert!(!markdown.contains("bool"));
     }
 }

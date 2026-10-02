@@ -53,7 +53,7 @@ fn the_map_is_written_once_and_rerunning_changes_nothing() {
         fs::read_to_string(dir.join("docs/domain-map.md")).unwrap(),
         first
     );
-    assert!(first.contains("cmd_Light_Switch --> evt_Light_Switched"));
+    assert!(first.contains("cmd-Light-Switch --> evt-Light-Switched"));
 }
 
 #[test]

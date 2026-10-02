@@ -61,7 +61,7 @@ fn run(options: &Options) -> Result<(), String> {
         // A missing map is as stale as a wrong one.
         if fs::read_to_string(&options.out).ok().as_deref() != Some(markdown.as_str()) {
             return Err(format!(
-                "{out} does not match the domain's source; run `cargo replay-map` to update it"
+                "{out} does not match the domain's source; rerun this command without `--check` to update it"
             ));
         }
         return Ok(());
