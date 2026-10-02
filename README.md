@@ -3206,7 +3206,22 @@ cargo install es-replay-map
 cargo replay-map --src crates/domain/src --out docs/domain-map.md
 ```
 
-`--src` is repeatable and defaults to `src`, and `--out` defaults to `docs/domain-map.md`. Run it with `--check` in CI: it writes nothing, and fails when the committed map differs from what the source generates. Pin the version you install (`--version =X.Y.Z`), because a new release may draw the same domain differently.
+`--src` is repeatable and defaults to `src`, and `--out` defaults to `docs/domain-map.md`.
+
+### Checking the map in CI
+
+With `--check` it writes nothing, and fails when the committed map differs from what the source generates. Two steps in a GitHub Actions job keep the map honest:
+
+```yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install replay-map
+        run: cargo install es-replay-map --version =0.12.0 --locked
+      - name: Domain map is up to date
+        run: cargo replay-map --src crates/domain/src --check
+```
+
+Pin the exact version, ideally the same one as the `es-replay` your domain depends on. A new release may draw the same domain differently, and an unpinned install would then fail the check with no change to your code. `cargo install` compiles the tool, which takes about a minute the first time; `rust-cache` keeps it after that.
 
 The map is read from source with `syn`, not from anything the macros expand to, since which command yields which event exists only in the match arms. So it asks one thing of the domain: each `handle` and `react` arm builds its events or commands inline, in result position, never through a helper call.
 
