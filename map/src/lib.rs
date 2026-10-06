@@ -117,23 +117,22 @@ impl DomainMap {
     /// bounded by the largest file rather than the domain; reparsing costs CPU, not memory.
     pub fn read(sources: &[Source]) -> Result<Self> {
         // A `#[cfg(test)] mod tests;` keeps its items in another file, which `walk` never sees the attribute of.
-        let mut test_only = Vec::new();
+        let mut modules = Vec::new();
         for source in sources {
             let file = parse(source)?;
             let dir = Path::new(&source.path).parent().unwrap_or(Path::new(""));
-            test_modules(
+            out_of_line_modules(
                 &file.items,
                 dir,
                 &children_dir(Path::new(&source.path)),
                 false,
-                &mut test_only,
+                &mut modules,
             );
         }
         let domain = || {
-            sources.iter().filter(|source| {
-                let path = normalize(Path::new(&source.path));
-                !test_only.iter().any(|test| path.starts_with(test))
-            })
+            sources
+                .iter()
+                .filter(|source| !test_only(&modules, &normalize(Path::new(&source.path))))
         };
         // Declarations first: a policy's arms can only be read once every `query_events!` wrapper is known.
         let mut scan = Scan::default();
@@ -360,11 +359,27 @@ fn parse(source: &Source) -> Result<syn::File> {
     })
 }
 
-/// Collects into `out` the file of every out-of-line module compiled only under test, and the directory its own
-/// submodules live in, by the reference's rules: `scope` is where this scope's `mod m;` lives (`m.rs` or `m/mod.rs`);
-/// a `#[path]` resolves against `dir`, the declaring file's directory, at the top level and against `scope` inside an
-/// inline module. `gated` marks a scope already inside a test-only module.
-fn test_modules(items: &[Item], dir: &Path, scope: &Path, gated: bool, out: &mut Vec<PathBuf>) {
+/// Whether the module declaration closest to `file` compiles it only under test. A file a test-only module and a
+/// production one both name, as `#[path]` allows, is production's.
+fn test_only(modules: &[(PathBuf, bool)], file: &Path) -> bool {
+    modules
+        .iter()
+        .filter(|(path, _)| file.starts_with(path))
+        .max_by_key(|(path, test)| (path.components().count(), !test))
+        .is_some_and(|(_, test)| *test)
+}
+
+/// Collects into `out` the file of every out-of-line module and the directory its own submodules live in, each with
+/// whether it is compiled only under test, by the reference's rules: `scope` is where this scope's `mod m;` lives
+/// (`m.rs` or `m/mod.rs`); a `#[path]` resolves against `dir`, the declaring file's directory, at the top level and
+/// against `scope` inside an inline module. `gated` marks a scope already inside a test-only module.
+fn out_of_line_modules(
+    items: &[Item],
+    dir: &Path,
+    scope: &Path,
+    gated: bool,
+    out: &mut Vec<(PathBuf, bool)>,
+) {
     use syn::ext::IdentExt;
 
     for item in items {
@@ -374,19 +389,18 @@ fn test_modules(items: &[Item], dir: &Path, scope: &Path, gated: bool, out: &mut
         match (&m.content, path) {
             (Some((_, items)), path) => {
                 let inner = scope.join(path.unwrap_or_else(|| m.ident.unraw().to_string()));
-                test_modules(items, &inner, &inner, test, out);
+                out_of_line_modules(items, &inner, &inner, test, out);
             }
-            (None, _) if !test => {}
             (None, Some(path)) => {
                 let file = normalize(&dir.join(path));
-                out.push(children_dir(&file));
-                out.push(file);
+                out.push((children_dir(&file), test));
+                out.push((file, test));
             }
             (None, None) => {
                 let module = normalize(&scope.join(m.ident.unraw().to_string()));
-                out.push(module.with_extension("rs"));
+                out.push((module.with_extension("rs"), test));
                 // `m/mod.rs` and every submodule of either form.
-                out.push(module);
+                out.push((module, test));
             }
         }
     }
@@ -635,9 +649,23 @@ fn aggregate(file: &str, mac: &Macro) -> Result<Located<AggregateDef>> {
             body.parse::<Token![:]>()?;
             let mut value = Vec::new();
             // `define_aggregate!` makes the comma between sections optional, so a value also ends where the next
-            // `key:` starts.
-            while !body.is_empty() && !body.peek(Token![,]) && !next_section(&body) {
-                value.push(body.parse::<TokenTree>()?);
+            // `key:` starts. Neither ends it inside a service path's generics, `Storage<String, usize>`, whose angle
+            // brackets are not token groups.
+            let mut angles = 0usize;
+            while !body.is_empty() && (angles > 0 || !body.peek(Token![,]) && !next_section(&body))
+            {
+                let token = body.parse::<TokenTree>()?;
+                if let TokenTree::Punct(punct) = &token {
+                    // The `>` of `->` and `=>` closes nothing.
+                    let arrow = matches!(value.last(), Some(TokenTree::Punct(p))
+                        if matches!(p.as_char(), '-' | '=') && p.spacing() == proc_macro2::Spacing::Joint);
+                    match punct.as_char() {
+                        '<' => angles += 1,
+                        '>' if !arrow => angles = angles.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                value.push(token);
             }
             let slot = match key.to_string().as_str() {
                 "commands" => Some(&mut commands),
@@ -828,13 +856,22 @@ fn tail_match<'a>(file: &str, imp: &'a ItemImpl, name: &str) -> Result<&'a ExprM
             format!("`fn {name}` in `impl ... for {}`", snippet(&imp.self_ty)),
         ));
     };
-    // A `return` before the dispatch would decide outside any arm, where no command or event names it.
     let (tail, before) = function.block.stmts.split_last().unzip();
+    let Some(Stmt::Expr(Expr::Match(m), None)) = tail else {
+        return Err(error(
+            file,
+            function.sig.ident.span(),
+            format!("`fn {name}` to end in a `match` whose arms name one variant each"),
+        ));
+    };
+    // A `return` before the dispatch, its scrutinee included, would decide outside any arm, where no command or event
+    // names it.
     let mut returns = Returns(Vec::new());
     before
         .into_iter()
         .flatten()
         .for_each(|stmt| returns.visit_stmt(stmt));
+    returns.visit_expr(&m.expr);
     if let Some(early) = returns.0.first() {
         return Err(error(
             file,
@@ -842,14 +879,7 @@ fn tail_match<'a>(file: &str, imp: &'a ItemImpl, name: &str) -> Result<&'a ExprM
             format!("`fn {name}` to return only from the arms of its closing `match`"),
         ));
     }
-    match tail {
-        Some(Stmt::Expr(Expr::Match(m), None)) => Ok(m),
-        _ => Err(error(
-            file,
-            function.sig.ident.span(),
-            format!("`fn {name}` to end in a `match` whose arms name one variant each"),
-        )),
-    }
+    Ok(m)
 }
 
 fn arms(file: &str, body: &ExprMatch, matched: &Matched, reader: &Reader) -> Result<Vec<Arm>> {
@@ -860,6 +890,10 @@ fn arms(file: &str, body: &ExprMatch, matched: &Matched, reader: &Reader) -> Res
             let mut wildcard = false;
             variants(file, &arm.pat, matched, &mut patterns, &mut wildcard)?;
             let mut built = Vec::new();
+            if let Some((_, guard)) = &arm.guard {
+                reader.exits(guard, &mut built)?;
+            }
+            reader.exits(&arm.body, &mut built)?;
             reader.expr(&arm.body, &mut built)?;
             // A wildcard names no variant, so there is nothing to draw an edge from.
             if wildcard && !built.is_empty() {
@@ -1041,6 +1075,7 @@ impl Reader<'_> {
                     Some(Expr::Closure(closure))
                         if call.args.len() == 1 && !self.mentioned_in(&call.receiver) =>
                     {
+                        self.exits(&closure.body, out)?;
                         self.expr(&closure.body, out)
                     }
                     _ => Err(self.unreadable(expr)),
@@ -1058,18 +1093,31 @@ impl Reader<'_> {
         }
     }
 
-    /// Every `return` in the block, then its tail. A `return` inside a nested block is read twice, once from here
-    /// and once from that block; `arms` dedupes what is built.
+    /// The block's tail. Its `return`s are read by `exits`, from the arm or closure it belongs to.
     fn block(&self, block: &Block, out: &mut Vec<Ref>) -> Result<()> {
-        let mut returns = Returns(Vec::new());
-        returns.visit_block(block);
-        for r in returns.0 {
-            self.returned(r, out)?;
-        }
         match block.stmts.last() {
             Some(Stmt::Expr(tail, None)) => self.expr(tail, out),
+            // `syn` reads a trailing `vec! { .. }` as a statement, though it is the block's value.
+            Some(Stmt::Macro(m)) if m.semi_token.is_none() => self.expr(
+                &Expr::Macro(syn::ExprMacro {
+                    attrs: m.attrs.clone(),
+                    mac: m.mac.clone(),
+                }),
+                out,
+            ),
             _ => Ok(()),
         }
+    }
+
+    /// Every `return` anywhere in `expr` that leaves the function or closure being read, in a guard, a condition or a
+    /// scrutinee as much as in result position: what it returns is built as surely as the tail is.
+    fn exits(&self, expr: &Expr, out: &mut Vec<Ref>) -> Result<()> {
+        let mut returns = Returns(Vec::new());
+        returns.visit_expr(expr);
+        returns
+            .0
+            .into_iter()
+            .try_for_each(|r| self.returned(r, out))
     }
 
     fn returned(&self, r: &ExprReturn, out: &mut Vec<Ref>) -> Result<()> {
@@ -1587,6 +1635,122 @@ mod inline {
         .unwrap_err();
 
         assert_eq!(error.file, "src/drawer.rs");
+    }
+
+    #[test]
+    fn a_file_a_test_module_shares_with_production_is_still_read() {
+        let root =
+            "mod cabinet;\n#[cfg(test)]\n#[path = \"cabinet.rs\"]\nmod cabinet_under_test;\n";
+
+        let map = read_all(&[("src/lib.rs", root), ("src/cabinet.rs", CABINET)]).unwrap();
+
+        assert_eq!(map.aggregates.len(), 1);
+    }
+
+    #[test]
+    fn a_return_in_the_closing_match_scrutinee_fails_at_its_line() {
+        let early =
+            "match { if self.locked { return Ok(vec![DrawerEvent::Unlocked]); } command } {";
+        let drawer = DRAWER.replace("match command {", early);
+
+        let error = read(&drawer, POLICY).unwrap_err();
+
+        assert_eq!(error.line, line_of(&drawer, early));
+    }
+
+    #[test]
+    fn a_return_in_a_guard_a_condition_or_a_closure_is_what_the_arm_issues() {
+        let policy = POLICY
+            .replace(
+                "CabinetEvent::Relabelled => Vec::new(),",
+                "CabinetEvent::Relabelled if { if self.on { return vec![(d(), DrawerCommand::Unlock)]; } false } => \
+                 Vec::new(),",
+            )
+            .replace(
+                "drawers.iter().map(|d| (d.clone(), DrawerCommand::Lock)).collect()",
+                "drawers.iter().map(|d| { if d.open() { return (d.clone(), DrawerCommand::Unlock); } \
+                 (d.clone(), DrawerCommand::Lock) }).collect()",
+            )
+            .replace(
+                "CabinetEvent::Installed { drawer } => CabinetUrn::try_from(event.stream_id.clone())",
+                "CabinetEvent::Installed { drawer } => if { if self.off { return vec![(d(), DrawerCommand::Lock)]; } \
+                 true } { Vec::new() } else { CabinetUrn::try_from(event.stream_id.clone())",
+            )
+            .replace(".unwrap_or_default(),", ".unwrap_or_default() },");
+
+        let map = read(DRAWER, &policy).unwrap();
+
+        assert_eq!(
+            map.policies[0].reactions,
+            [
+                (
+                    refs(&[("Cabinet", "Installed")]),
+                    refs(&[("Drawer", "Lock"), ("Drawer", "Fit")])
+                ),
+                (
+                    refs(&[("Cabinet", "Sealed")]),
+                    refs(&[("Drawer", "Unlock"), ("Drawer", "Lock")])
+                ),
+                (
+                    refs(&[("Cabinet", "Relabelled")]),
+                    refs(&[("Drawer", "Unlock")])
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_guard_that_returns_through_a_helper_fails_at_its_line() {
+        let guard = "CabinetEvent::Relabelled if { if self.on { return lock_all(); } false } => Vec::new(),";
+        let policy = POLICY.replace("CabinetEvent::Relabelled => Vec::new(),", guard);
+
+        let error = read(DRAWER, &policy).unwrap_err();
+
+        assert_eq!(error.line, line_of(&policy, guard));
+    }
+
+    #[test]
+    fn a_trailing_brace_delimited_vec_is_read_as_the_arms_value() {
+        let policy = HOUSEKEEPING.replace(
+            "_ => Vec::new(),",
+            "_ => { vec! { Dispatch::to::<Cabinet>(cabinet(), CabinetCommand::Seal) } }",
+        );
+
+        let error = read_all(&[
+            ("cabinet.rs", CABINET),
+            ("drawer.rs", DRAWER),
+            ("p.rs", &policy),
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.line, line_of(&policy, "_ => { vec! {"));
+    }
+
+    #[test]
+    fn a_service_path_with_generic_arguments_is_read() {
+        let source = r#"
+define_aggregate! {
+    Ledger {
+        commands: { Post },
+        events: { Posted }
+        service: Storage<String, usize> + Callback<Box<dyn Fn(u8) -> u8>, Bound<Item: Clone>> {
+            fn get(key: &str) -> usize;
+        }
+    }
+}
+
+impl Aggregate for Ledger {
+    async fn handle(&self, command: Self::Command, _: &Self::Services) -> R {
+        match command {
+            LedgerCommand::Post => Ok(vec![LedgerEvent::Posted]),
+        }
+    }
+}
+"#;
+
+        let map = read_all(&[("ledger.rs", source)]).unwrap();
+
+        assert_eq!(map.aggregates[0].decisions, refs(&[("Post", "Posted")]));
     }
 
     #[test]
