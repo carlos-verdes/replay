@@ -558,12 +558,7 @@ impl Policy for DiesOutsideTheReaction {
     type Event = ProbeEvent;
 
     fn name(&self) -> &str {
-        let staged = self
-            .deaths_to_stage
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            })
-            .is_ok();
+        let staged = common::policy_harness::take_one(&self.deaths_to_stage);
 
         if staged {
             self.deaths.fetch_add(1, Ordering::SeqCst);
