@@ -86,7 +86,12 @@ impl DiesOutsideTheReaction {
             return;
         }
 
-        let staged = common::policy_harness::take_one(&self.deaths_to_stage);
+        let staged = self
+            .deaths_to_stage
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
 
         if staged {
             self.deaths.fetch_add(1, Ordering::SeqCst);

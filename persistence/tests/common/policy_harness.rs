@@ -1452,19 +1452,3 @@ fn spawn_daemon(
     .build()
     .start_polling(DAEMON_POLL_INTERVAL)
 }
-
-/// Takes one from `budget` if any is left, returning whether it did.
-///
-/// A `compare_exchange` loop rather than `fetch_update`, which Rust 1.99 deprecated for
-/// `try_update`: that replacement does not exist on older toolchains, and this compiles
-/// warning-free on both.
-pub fn take_one(budget: &std::sync::atomic::AtomicUsize) -> bool {
-    let mut left = budget.load(Ordering::SeqCst);
-    while left > 0 {
-        match budget.compare_exchange_weak(left, left - 1, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return true,
-            Err(now) => left = now,
-        }
-    }
-    false
-}
