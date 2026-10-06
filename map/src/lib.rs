@@ -113,25 +113,39 @@ pub struct DomainMap {
 }
 
 impl DomainMap {
+    /// Each pass parses one file at a time and drops its syntax tree before the next, so the trees held at once are
+    /// bounded by the largest file rather than the domain; reparsing costs CPU, not memory.
     pub fn read(sources: &[Source]) -> Result<Self> {
-        let mut files = Vec::new();
+        // A `#[cfg(test)] mod tests;` keeps its items in another file, which `walk` never sees the attribute of.
+        let mut test_only = Vec::new();
         for source in sources {
-            let file = syn::parse_file(&source.text).map_err(|e| {
-                error(
-                    &source.path,
-                    e.span(),
-                    format!("expected Rust that parses: {e}"),
-                )
-            })?;
-            files.push((source.path.as_str(), file));
+            let file = parse(source)?;
+            let dir = Path::new(&source.path).parent().unwrap_or(Path::new(""));
+            test_modules(
+                &file.items,
+                dir,
+                &children_dir(Path::new(&source.path)),
+                false,
+                &mut test_only,
+            );
         }
+        let domain = || {
+            sources.iter().filter(|source| {
+                let path = normalize(Path::new(&source.path));
+                !test_only.iter().any(|test| path.starts_with(test))
+            })
+        };
         // Declarations first: a policy's arms can only be read once every `query_events!` wrapper is known.
         let mut scan = Scan::default();
-        for (path, file) in &files {
-            walk(&file.items, &mut |item| scan.declaration(path, item))?;
+        for source in domain() {
+            walk(&parse(source)?.items, &mut |item| {
+                scan.declaration(&source.path, item)
+            })?;
         }
-        for (path, file) in &files {
-            walk(&file.items, &mut |item| scan.behaviour(path, item))?;
+        for source in domain() {
+            walk(&parse(source)?.items, &mut |item| {
+                scan.behaviour(&source.path, item)
+            })?;
         }
         scan.assemble()
     }
@@ -334,6 +348,90 @@ fn walk<'a>(items: &'a [Item], visit: &mut impl FnMut(&'a Item) -> Result<()>) -
         }
     }
     Ok(())
+}
+
+fn parse(source: &Source) -> Result<syn::File> {
+    syn::parse_file(&source.text).map_err(|e| {
+        error(
+            &source.path,
+            e.span(),
+            format!("expected Rust that parses: {e}"),
+        )
+    })
+}
+
+/// Collects into `out` the file of every out-of-line module compiled only under test, and the directory its own
+/// submodules live in, by the reference's rules: `scope` is where this scope's `mod m;` lives (`m.rs` or `m/mod.rs`);
+/// a `#[path]` resolves against `dir`, the declaring file's directory, at the top level and against `scope` inside an
+/// inline module. `gated` marks a scope already inside a test-only module.
+fn test_modules(items: &[Item], dir: &Path, scope: &Path, gated: bool, out: &mut Vec<PathBuf>) {
+    use syn::ext::IdentExt;
+
+    for item in items {
+        let Item::Mod(m) = item else { continue };
+        let test = gated || is_test(&m.attrs);
+        let path = path_attr(&m.attrs);
+        match (&m.content, path) {
+            (Some((_, items)), path) => {
+                let inner = scope.join(path.unwrap_or_else(|| m.ident.unraw().to_string()));
+                test_modules(items, &inner, &inner, test, out);
+            }
+            (None, _) if !test => {}
+            (None, Some(path)) => {
+                let file = normalize(&dir.join(path));
+                out.push(children_dir(&file));
+                out.push(file);
+            }
+            (None, None) => {
+                let module = normalize(&scope.join(m.ident.unraw().to_string()));
+                out.push(module.with_extension("rs"));
+                // `m/mod.rs` and every submodule of either form.
+                out.push(module);
+            }
+        }
+    }
+}
+
+/// Where the submodules of the module in `file` live: beside a `mod.rs`, `lib.rs` or `main.rs`, under a directory
+/// named for any other file.
+fn children_dir(file: &Path) -> PathBuf {
+    let dir = file.parent().unwrap_or(Path::new(""));
+    match file.file_stem().and_then(|stem| stem.to_str()) {
+        Some("mod" | "lib" | "main") | None => dir.to_path_buf(),
+        Some(stem) => dir.join(stem),
+    }
+}
+
+fn path_attr(attrs: &[Attribute]) -> Option<String> {
+    attrs.iter().find_map(|attr| match &attr.meta {
+        Meta::NameValue(nv) if nv.path.is_ident("path") => match &nv.value {
+            Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) => Some(s.value()),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// Resolves `.` and `..` without the file system, so a `#[path = "../x.rs"]` matches the path `x.rs` was read under.
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 impl Scan {
@@ -1435,6 +1533,60 @@ mod tests {
 "#;
 
         assert!(read_all(&[("cabinet.rs", CABINET), ("tests.rs", tests)]).is_ok());
+    }
+
+    #[test]
+    fn a_module_compiled_only_under_test_in_another_file_is_skipped() {
+        let unreadable = r#"
+impl Aggregate for OnlyInTests {
+    async fn handle(&self) -> R { helper() }
+}
+"#;
+        let root = r#"
+mod cabinet;
+mod drawer;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+#[path = "../fixtures/support.rs"]
+mod support;
+mod inline {
+    #[cfg(test)]
+    mod nested;
+}
+"#;
+        let drawer = format!("{DRAWER}\n#[cfg(all(test, unix))]\nmod fakes;\n");
+
+        let map = read_all(&[
+            ("src/lib.rs", root),
+            ("src/cabinet.rs", CABINET),
+            ("src/drawer.rs", &drawer),
+            ("src/tests.rs", unreadable),
+            ("src/tests/deeper.rs", unreadable),
+            ("src/drawer/fakes/mod.rs", unreadable),
+            ("src/drawer/fakes/more.rs", unreadable),
+            ("src/inline/nested.rs", unreadable),
+            ("fixtures/support.rs", unreadable),
+        ])
+        .unwrap();
+
+        assert_eq!(map.aggregates.len(), 2);
+    }
+
+    #[test]
+    fn a_module_compiled_outside_test_beside_a_test_one_is_still_read() {
+        let root = "mod drawer;\n#[cfg(test)]\nmod drawer_tests;\n";
+        let unreadable = "impl Aggregate for X { async fn handle(&self) -> R { helper() } }";
+
+        let error = read_all(&[
+            ("src/lib.rs", root),
+            ("src/cabinet.rs", CABINET),
+            ("src/drawer.rs", unreadable),
+            ("src/drawer_tests.rs", unreadable),
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.file, "src/drawer.rs");
     }
 
     #[test]
