@@ -472,7 +472,11 @@ fn out_of_line_modules(
                 match path {
                     Some(path) => {
                         let target = normalize(&dir.join(path));
-                        push(children_dir(&target));
+                        // `#[path = "mod.rs"]` beside the declaring file would claim that file's own directory.
+                        let children = children_dir(&target);
+                        if !file.starts_with(&children) {
+                            push(children);
+                        }
                         push(target);
                     }
                     None => {
@@ -974,6 +978,7 @@ fn tail_match<'a>(file: &str, imp: &'a ItemImpl, name: &str) -> Result<&'a ExprM
 fn arms(file: &str, body: &ExprMatch, matched: &Matched, reader: &Reader) -> Result<Vec<Arm>> {
     body.arms
         .iter()
+        .filter(|arm| !is_test(&arm.attrs))
         .map(|arm| {
             let mut patterns = Vec::new();
             let mut wildcard = false;
@@ -1068,7 +1073,8 @@ fn variant_of(path: &syn::Path, prefix: &str) -> Option<String> {
     let segments: Vec<_> = path.segments.iter().collect();
     match segments.as_slice() {
         // Qualified or not: `crate::bank::BankAccountEvent::Deposited` names the same variant.
-        [.., head, variant] if ident_name(&head.ident) == prefix && head.arguments.is_none() => {
+        // The enum's generic arguments, `FileManagerEvent::<T>`, do not change the variant.
+        [.., head, variant] if ident_name(&head.ident) == prefix => {
             Some(ident_name(&variant.ident))
         }
         _ => None,
@@ -1128,7 +1134,11 @@ impl Reader<'_> {
                     None => Ok(()),
                 }
             }
-            Expr::Match(m) => m.arms.iter().try_for_each(|arm| self.expr(&arm.body, out)),
+            Expr::Match(m) => m
+                .arms
+                .iter()
+                .filter(|arm| !is_test(&arm.attrs))
+                .try_for_each(|arm| self.expr(&arm.body, out)),
             Expr::Return(r) => self.returned(r, out),
             Expr::Call(call) => match (path_of(&call.func).as_deref(), &self.builds) {
                 (Some([err]), _) if err == "Err" => Ok(()),
@@ -1334,6 +1344,13 @@ impl<'ast> Visit<'ast> for Returns {
     fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
 
     fn visit_item(&mut self, _: &'ast Item) {}
+
+    /// A `#[cfg(test)]` arm is not compiled outside test, so nothing it returns is built.
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if !is_test(&arm.attrs) {
+            visit::visit_arm(self, arm);
+        }
+    }
 }
 
 fn mentions_return(tokens: proc_macro2::TokenStream) -> bool {
@@ -2124,6 +2141,73 @@ impl Aggregate for Gate {
         let (line, expected) =
             read_arm("_ => { custom!(when on => { return self.reseal(); }); Vec::new() }");
         assert_eq!(line, expected);
+    }
+
+    #[test]
+    fn a_test_module_at_the_declaring_files_own_mod_rs_gates_only_itself() {
+        let unreadable = "impl Aggregate for X { async fn handle(&self) -> R { helper() } }";
+        let tests = format!("mod fixtures;\n{unreadable}\n");
+
+        let map = read_all(&[
+            (
+                "src/lib.rs",
+                "mod cabinet;\n#[cfg(test)]\n#[path = \"mod.rs\"]\nmod tests;\n",
+            ),
+            ("src/cabinet.rs", CABINET),
+            ("src/mod.rs", &tests),
+            ("src/fixtures.rs", unreadable),
+        ])
+        .unwrap();
+
+        assert_eq!(map.aggregates.len(), 1);
+    }
+
+    #[test]
+    fn an_enums_generic_arguments_do_not_change_its_variant() {
+        let source = r#"
+define_aggregate! {
+    FileManager<T: PartialEq> {
+        commands: { ProcessFile { data: T } },
+        events: { FileProcessed { data: T } }
+    }
+}
+
+impl<T: PartialEq> Aggregate for FileManager<T> {
+    async fn handle(&self, command: Self::Command, _: &Self::Services) -> R {
+        match command {
+            FileManagerCommand::<T>::ProcessFile { data } => Ok(vec![FileManagerEvent::<T>::FileProcessed { data }]),
+        }
+    }
+}
+"#;
+
+        let map = read_all(&[("file_manager.rs", source)]).unwrap();
+
+        assert_eq!(
+            map.aggregates[0].decisions,
+            refs(&[("ProcessFile", "FileProcessed")])
+        );
+    }
+
+    #[test]
+    fn a_test_only_arm_builds_nothing() {
+        let drawer = DRAWER
+            .replace(
+                "            DrawerCommand::Lock =>",
+                "            #[cfg(test)]\n            DrawerCommand::Lock => Ok(vec![DrawerEvent::Unlocked]),\n            \
+                 #[cfg(test)]\n            DrawerCommand::Unlock => { return self.helper(); }\n            \
+                 DrawerCommand::Lock =>",
+            )
+            .replace(
+                "DrawerCommand::Store(item) => Ok(vec![DrawerEvent::ItemStored(item)]),",
+                "DrawerCommand::Store(item) => match item {\n                #[cfg(test)]\n                _ => \
+                 Ok(vec![DrawerEvent::Unlocked]),\n                _ => Ok(vec![DrawerEvent::ItemStored(item)]),\n            },",
+            );
+
+        let map = read(&drawer, POLICY).unwrap();
+        let plain = read(DRAWER, POLICY).unwrap();
+
+        assert_eq!(map.aggregates, plain.aggregates);
     }
 
     #[test]
