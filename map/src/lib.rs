@@ -862,7 +862,9 @@ fn policy(
         imp.items
             .iter()
             .find_map(|item| match item {
-                ImplItem::Type(t) if ident_name(&t.ident) == wanted => type_name(&t.ty),
+                ImplItem::Type(t) if ident_name(&t.ident) == wanted && !is_test(&t.attrs) => {
+                    type_name(&t.ty)
+                }
                 _ => None,
             })
             .ok_or_else(|| {
@@ -932,7 +934,7 @@ fn type_name(ty: &Type) -> Option<String> {
 /// The `match` that `fn <name>` ends in.
 fn tail_match<'a>(file: &str, imp: &'a ItemImpl, name: &str) -> Result<&'a ExprMatch> {
     let function = imp.items.iter().find_map(|item| match item {
-        ImplItem::Fn(f) if ident_name(&f.sig.ident) == name => Some(f),
+        ImplItem::Fn(f) if ident_name(&f.sig.ident) == name && !is_test(&f.attrs) => Some(f),
         _ => None,
     });
     let Some(function) = function else {
@@ -952,16 +954,17 @@ fn tail_match<'a>(file: &str, imp: &'a ItemImpl, name: &str) -> Result<&'a ExprM
     };
     // A `return` before the dispatch, its scrutinee included, would decide outside any arm, where no command or event
     // names it.
-    let mut returns = Returns(Vec::new());
+    let mut returns = Returns::default();
     before
         .into_iter()
         .flatten()
         .for_each(|stmt| returns.visit_stmt(stmt));
     returns.visit_expr(&m.expr);
-    if let Some(early) = returns.0.first() {
+    let early = returns.found.iter().map(Spanned::span);
+    if let Some(early) = early.chain(returns.hidden.iter().copied()).next() {
         return Err(error(
             file,
-            early.span(),
+            early,
             format!("`fn {name}` to return only from the arms of its closing `match`"),
         ));
     }
@@ -1064,7 +1067,8 @@ fn variants(
 fn variant_of(path: &syn::Path, prefix: &str) -> Option<String> {
     let segments: Vec<_> = path.segments.iter().collect();
     match segments.as_slice() {
-        [head, variant] if ident_name(&head.ident) == prefix && head.arguments.is_none() => {
+        // Qualified or not: `crate::bank::BankAccountEvent::Deposited` names the same variant.
+        [.., head, variant] if ident_name(&head.ident) == prefix && head.arguments.is_none() => {
             Some(ident_name(&variant.ident))
         }
         _ => None,
@@ -1088,7 +1092,7 @@ fn path_of(expr: &Expr) -> Option<Vec<String>> {
 fn dispatch_target(func: &Expr) -> Option<String> {
     let Expr::Path(p) = func else { return None };
     let segments: Vec<_> = p.path.segments.iter().collect();
-    let [dispatch, to] = segments.as_slice() else {
+    let [.., dispatch, to] = segments.as_slice() else {
         return None;
     };
     if dispatch.ident != "Dispatch" || to.ident != "to" {
@@ -1200,9 +1204,16 @@ impl Reader<'_> {
     /// Every `return` anywhere in `expr` that leaves the function or closure being read, in a guard, a condition or a
     /// scrutinee as much as in result position: what it returns is built as surely as the tail is.
     fn exits(&self, expr: &Expr, out: &mut Vec<Ref>) -> Result<()> {
-        let mut returns = Returns(Vec::new());
+        let mut returns = Returns::default();
         returns.visit_expr(expr);
-        returns.0.iter().try_for_each(|r| self.returned(r, out))
+        if let Some(&hidden) = returns.hidden.first() {
+            return Err(error(
+                self.file,
+                hidden,
+                self.expected("a `return` inside a macro whose input is not expressions"),
+            ));
+        }
+        returns.found.iter().try_for_each(|r| self.returned(r, out))
     }
 
     fn returned(&self, r: &ExprReturn, out: &mut Vec<Ref>) -> Result<()> {
@@ -1285,32 +1296,36 @@ impl Reader<'_> {
     }
 }
 
-/// The `return`s that leave the function being read: not those of a closure or a nested item. A `vec!`'s elements are
-/// parsed and searched too, wherever it stands, since a macro's tokens are otherwise opaque to the visitor.
-struct Returns(Vec<ExprReturn>);
+/// The `return`s that leave the function being read: not those of a closure or a nested item. A macro's tokens are
+/// opaque to the visitor, so one whose input reads as expressions, as `vec!`, `format!` and `assert!` do, is parsed and
+/// searched; one whose input does not is `hidden` if a `return` appears anywhere in it.
+#[derive(Default)]
+struct Returns {
+    found: Vec<ExprReturn>,
+    hidden: Vec<Span>,
+}
 
 impl<'ast> Visit<'ast> for Returns {
     fn visit_expr_return(&mut self, r: &'ast ExprReturn) {
-        self.0.push(r.clone());
+        self.found.push(r.clone());
         visit::visit_expr_return(self, r);
     }
 
     fn visit_macro(&mut self, mac: &'ast Macro) {
-        if !mac.path.is_ident("vec") {
-            return;
-        }
+        // `vec![element; count]`.
         let repeated = |input: ParseStream| -> syn::Result<[Expr; 2]> {
             let element: Expr = input.parse()?;
             input.parse::<Token![;]>()?;
             Ok([element, input.parse()?])
         };
-        match Punctuated::<Expr, Token![,]>::parse_terminated.parse2(mac.tokens.clone()) {
-            Ok(items) => items.iter().for_each(|item| self.visit_expr(item)),
-            Err(_) => {
-                if let Ok(items) = repeated.parse2(mac.tokens.clone()) {
-                    items.iter().for_each(|item| self.visit_expr(item));
-                }
-            }
+        if let Ok(items) =
+            Punctuated::<Expr, Token![,]>::parse_terminated.parse2(mac.tokens.clone())
+        {
+            items.iter().for_each(|item| self.visit_expr(item));
+        } else if let Ok(items) = repeated.parse2(mac.tokens.clone()) {
+            items.iter().for_each(|item| self.visit_expr(item));
+        } else if mentions_return(mac.tokens.clone()) {
+            self.hidden.push(mac.path.span());
         }
     }
 
@@ -1319,6 +1334,14 @@ impl<'ast> Visit<'ast> for Returns {
     fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
 
     fn visit_item(&mut self, _: &'ast Item) {}
+}
+
+fn mentions_return(tokens: proc_macro2::TokenStream) -> bool {
+    tokens.into_iter().any(|token| match token {
+        TokenTree::Ident(ident) => ident == "return",
+        TokenTree::Group(group) => mentions_return(group.stream()),
+        _ => false,
+    })
 }
 
 #[cfg(test)]
@@ -2027,6 +2050,80 @@ impl Aggregate for Gate {
         let error = read(&drawer, POLICY).unwrap_err();
 
         assert_eq!(error.line, line_of(&drawer, early));
+    }
+
+    #[test]
+    fn a_test_only_member_of_an_impl_is_passed_over_even_when_it_comes_first() {
+        let drawer = DRAWER.replace(
+            "impl Aggregate for Drawer {\n",
+            "impl Aggregate for Drawer {\n    #[cfg(test)]\n    async fn handle(&self) -> R { helper() }\n\n",
+        );
+        let policy = POLICY.replace(
+            "    type Event = CabinetEvent;\n",
+            "    #[cfg(test)]\n    type Event = Bogus;\n    type Event = CabinetEvent;\n",
+        );
+
+        let map = read(&drawer, &policy).unwrap();
+        let plain = read(DRAWER, POLICY).unwrap();
+
+        assert_eq!(map.aggregates, plain.aggregates);
+        assert_eq!(map.policies, plain.policies);
+    }
+
+    #[test]
+    fn a_qualified_path_names_the_same_variant_and_dispatch_target() {
+        let drawer = DRAWER
+            .replace(
+                "DrawerCommand::Store(item) => Ok(vec![DrawerEvent::ItemStored(item)])",
+                "crate::drawer::DrawerCommand::Store(item) => Ok(vec![crate::drawer::DrawerEvent::ItemStored(item)])",
+            );
+        let policy = HOUSEKEEPING.replace(
+            "vec![Dispatch::to::<Cabinet>(cabinet(), CabinetCommand::Seal)]",
+            "vec![replay_persistence::Dispatch::to::<Cabinet>(cabinet(), crate::cabinet::CabinetCommand::Seal)]",
+        );
+        let sources = |drawer: &str, policy: &str| {
+            read_all(&[
+                ("cabinet.rs", CABINET),
+                ("drawer.rs", drawer),
+                ("housekeeping.rs", policy),
+            ])
+            .unwrap()
+        };
+
+        let map = sources(&drawer, &policy);
+        let plain = sources(DRAWER, HOUSEKEEPING);
+
+        assert_eq!(map.aggregates, plain.aggregates);
+        assert_eq!(map.policies, plain.policies);
+    }
+
+    #[test]
+    fn a_return_inside_any_macro_is_read_or_rejected_at_its_line() {
+        let read_arm = |arm: &str| {
+            let policy = HOUSEKEEPING.replace("_ => Vec::new(),", arm);
+            let error = read_all(&[
+                ("cabinet.rs", CABINET),
+                ("drawer.rs", DRAWER),
+                ("p.rs", &policy),
+            ])
+            .unwrap_err();
+            (error.line, line_of(&policy, "_ => {"))
+        };
+
+        // Through a helper, inside `format!`'s arguments: unreadable.
+        let (line, expected) =
+            read_arm("_ => { let _ = format!(\"{}\", { if self.on { return self.reseal(); } 0u8 }); Vec::new() }");
+        assert_eq!(line, expected);
+        // Inline, in the same place: a command a `_` arm may not issue.
+        let (line, expected) = read_arm(
+            "_ => { let _ = format!(\"{}\", { if self.on { return vec![Dispatch::to::<Cabinet>(c(), \
+             CabinetCommand::Seal)]; } 0u8 }); Vec::new() }",
+        );
+        assert_eq!(line, expected);
+        // In a macro whose input is not expressions: rejected, since it cannot be read.
+        let (line, expected) =
+            read_arm("_ => { custom!(when on => { return self.reseal(); }); Vec::new() }");
+        assert_eq!(line, expected);
     }
 
     #[test]
