@@ -167,6 +167,7 @@ impl DomainMap {
             let file = parse(source)?;
             let dir = Path::new(&source.path).parent().unwrap_or(Path::new(""));
             out_of_line_modules(
+                &normalize(Path::new(&source.path)),
                 &file.items,
                 dir,
                 &children_dir(Path::new(&source.path)),
@@ -403,26 +404,48 @@ fn parse(source: &Source) -> Result<syn::File> {
     })
 }
 
-/// Whether the module declaration closest to `file` compiles it only under test. A file a test-only module and a
-/// production one both name, as `#[path]` allows, is production's.
-fn test_only(modules: &[(PathBuf, bool)], file: &Path) -> bool {
-    modules
-        .iter()
-        .filter(|(path, _)| file.starts_with(path))
-        .max_by_key(|(path, test)| (path.components().count(), !test))
-        .is_some_and(|(_, test)| *test)
+/// An out-of-line module's file, or the directory its submodules live in, as one `mod` declaration names it.
+struct Module {
+    path: PathBuf,
+    /// Compiled only under test by its own `cfg` or an inline module's around it.
+    test: bool,
+    /// The file the declaration is in, whose own gate the module inherits.
+    declared_in: PathBuf,
+}
+
+/// Whether `file` is compiled only under test: every declaration closest to it is test-only, by its own `cfg` or by
+/// sitting in a file that is itself test-only. A file a test-only module and a production one both name, as `#[path]`
+/// allows, is production's. Read once every file has been seen, so source order does not matter.
+fn test_only(modules: &[Module], file: &Path) -> bool {
+    gated(modules, file, 0)
+}
+
+fn gated(modules: &[Module], file: &Path, depth: usize) -> bool {
+    // Deeper than any real module tree: a `#[path]` cycle, which rustc rejects anyway.
+    if depth > 64 {
+        return false;
+    }
+    let naming = || modules.iter().filter(|m| file.starts_with(&m.path));
+    let Some(closest) = naming().map(|m| m.path.components().count()).max() else {
+        return false;
+    };
+    naming()
+        .filter(|m| m.path.components().count() == closest)
+        .all(|m| m.test || gated(modules, &m.declared_in, depth + 1))
 }
 
 /// Collects into `out` the file of every out-of-line module and the directory its own submodules live in, each with
 /// whether it is compiled only under test, by the reference's rules: `scope` is where this scope's `mod m;` lives
 /// (`m.rs` or `m/mod.rs`); a `#[path]` resolves against `dir`, the declaring file's directory, at the top level and
-/// against `scope` inside an inline module. `gated` marks a scope already inside a test-only module.
+/// against `scope` inside an inline module. `gated` marks a scope already inside a test-only module; a gate on
+/// `file` itself is resolved later, by `test_only`.
 fn out_of_line_modules(
+    file: &Path,
     items: &[Item],
     dir: &Path,
     scope: &Path,
     gated: bool,
-    out: &mut Vec<(PathBuf, bool)>,
+    out: &mut Vec<Module>,
 ) {
     use syn::ext::IdentExt;
 
@@ -433,18 +456,29 @@ fn out_of_line_modules(
         match (&m.content, path) {
             (Some((_, items)), path) => {
                 let inner = scope.join(path.unwrap_or_else(|| m.ident.unraw().to_string()));
-                out_of_line_modules(items, &inner, &inner, test, out);
+                out_of_line_modules(file, items, &inner, &inner, test, out);
             }
-            (None, Some(path)) => {
-                let file = normalize(&dir.join(path));
-                out.push((children_dir(&file), test));
-                out.push((file, test));
-            }
-            (None, None) => {
-                let module = normalize(&scope.join(m.ident.unraw().to_string()));
-                out.push((module.with_extension("rs"), test));
-                // `m/mod.rs` and every submodule of either form.
-                out.push((module, test));
+            (None, path) => {
+                let mut push = |path: PathBuf| {
+                    out.push(Module {
+                        path,
+                        test,
+                        declared_in: file.to_path_buf(),
+                    })
+                };
+                match path {
+                    Some(path) => {
+                        let target = normalize(&dir.join(path));
+                        push(children_dir(&target));
+                        push(target);
+                    }
+                    None => {
+                        let module = normalize(&scope.join(m.ident.unraw().to_string()));
+                        push(module.with_extension("rs"));
+                        // `m/mod.rs` and every submodule of either form.
+                        push(module);
+                    }
+                }
             }
         }
     }
@@ -1072,6 +1106,8 @@ impl Reader<'_> {
         match expr {
             Expr::Paren(p) => self.expr(&p.expr, out),
             Expr::Group(g) => self.expr(&g.expr, out),
+            // A labeled block can yield through `break 'label value`, which is not read.
+            Expr::Block(b) if b.label.is_some() => Err(self.unreadable(expr)),
             Expr::Block(b) => self.block(&b.block, out),
             Expr::If(i) => {
                 self.block(&i.then_branch, out)?;
@@ -1106,7 +1142,11 @@ impl Reader<'_> {
                 let items = Punctuated::<Expr, Token![,]>::parse_terminated
                     .parse2(m.mac.tokens.clone())
                     .map_err(|_| self.unreadable(expr))?;
-                items.iter().try_for_each(|item| self.expr(item, out))
+                // The `Returns` that read the arm cannot see into the macro's tokens.
+                items.iter().try_for_each(|item| {
+                    self.exits(item, out)?;
+                    self.expr(item, out)
+                })
             }
             Expr::MethodCall(call) => match call.method.to_string().as_str() {
                 "collect" | "unwrap_or_default" if call.args.is_empty() => {
@@ -1795,6 +1835,69 @@ impl Aggregate for Ledger {
         let map = read_all(&[("ledger.rs", source)]).unwrap();
 
         assert_eq!(map.aggregates[0].decisions, refs(&[("Post", "Posted")]));
+    }
+
+    #[test]
+    fn a_module_declared_in_a_test_only_file_is_test_only_too() {
+        let unreadable = "impl Aggregate for X { async fn handle(&self) -> R { helper() } }";
+
+        // The child comes first: its gate is inherited however the sources are ordered.
+        let map = read_all(&[
+            ("src/tests/fixtures.rs", unreadable),
+            ("src/tests/fixtures/deeper.rs", unreadable),
+            ("src/lib.rs", "mod cabinet;\n#[cfg(test)]\nmod tests;\n"),
+            ("src/cabinet.rs", CABINET),
+            ("src/tests.rs", "mod fixtures;\n"),
+        ])
+        .unwrap();
+
+        assert_eq!(map.aggregates.len(), 1);
+    }
+
+    #[test]
+    fn a_labeled_block_is_rejected_at_its_line() {
+        let arm = "_ => 'out: { if self.enabled { break 'out vec![Dispatch::to::<Drawer>(id(), DrawerCommand::Lock)]; } \
+                   Vec::new() }";
+        let policy = HOUSEKEEPING.replace("_ => Vec::new(),", arm);
+
+        let error = read_all(&[
+            ("cabinet.rs", CABINET),
+            ("drawer.rs", DRAWER),
+            ("p.rs", &policy),
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.line, line_of(&policy, "'out: {"));
+    }
+
+    #[test]
+    fn a_return_inside_a_vec_element_is_what_the_arm_builds() {
+        let drawer = DRAWER.replace(
+            "Ok(if self.locked { Vec::new() } else { vec![DrawerEvent::Locked] })",
+            "Ok(vec![{ if self.locked { return Ok(vec![DrawerEvent::Unlocked]); } DrawerEvent::Locked }])",
+        );
+
+        let map = read(&drawer, POLICY).unwrap();
+
+        let drawer = map.aggregates.iter().find(|a| a.name == "Drawer").unwrap();
+        assert!(drawer
+            .decisions
+            .contains(&("Lock".to_owned(), "Unlocked".to_owned())));
+        assert!(drawer
+            .decisions
+            .contains(&("Lock".to_owned(), "Locked".to_owned())));
+    }
+
+    #[test]
+    fn a_return_inside_a_vec_element_through_a_helper_fails_at_its_line() {
+        let drawer = DRAWER.replace(
+            "Ok(if self.locked { Vec::new() } else { vec![DrawerEvent::Locked] })",
+            "Ok(vec![{ if self.locked { return self.unlock(); } DrawerEvent::Locked }])",
+        );
+
+        let error = read(&drawer, POLICY).unwrap_err();
+
+        assert_eq!(error.line, line_of(&drawer, "return self.unlock()"));
     }
 
     #[test]
