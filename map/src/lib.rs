@@ -159,8 +159,9 @@ pub struct DomainMap {
 }
 
 impl DomainMap {
-    /// Each pass reads and parses one file at a time and drops it before the next, so what is held at once is
-    /// bounded by the largest file rather than the domain; rereading costs time, not memory.
+    /// Each pass reads and parses one file at a time and drops it before the next, so the source text and syntax tree
+    /// held at once are bounded by the largest file rather than the domain; rereading costs time, not memory. What
+    /// does grow with the domain is the map itself, its names and edges, which is what this returns.
     pub fn read<S: Sources + ?Sized>(sources: &S) -> Result<Self> {
         // A `#[cfg(test)] mod tests;` keeps its items in another file, which `walk` never sees the attribute of.
         let mut modules = Vec::new();
@@ -768,7 +769,9 @@ fn aggregate(file: &str, mac: &Macro) -> Result<Located<AggregateDef>> {
                     [TokenTree::Group(group)] if group.delimiter() == Delimiter::Brace => group,
                     _ => return Err(syn::Error::new(key.span(), format!("`{key}: {{ .. }}`"))),
                 };
-                *slot = Some(variant_names.parse2(group.stream())?);
+                // A repeated section adds to the earlier one, as it does in the macro.
+                slot.get_or_insert_with(Vec::new)
+                    .extend(variant_names.parse2(group.stream())?);
             }
             if body.peek(Token![,]) {
                 body.parse::<Token![,]>()?;
@@ -1160,6 +1163,7 @@ impl Reader<'_> {
                 (_, Builds::Pairs(_)) => Err(self.unreadable(expr)),
             },
             Expr::Path(p) if p.path.is_ident("None") => Ok(()),
+            Expr::Macro(m) if diverges(&m.mac) => Ok(()),
             Expr::Macro(m) if m.mac.path.is_ident("vec") => {
                 let items = Punctuated::<Expr, Token![,]>::parse_terminated
                     .parse2(m.mac.tokens.clone())
@@ -1207,6 +1211,19 @@ impl Reader<'_> {
                 }),
                 out,
             ),
+            // A block that ends in `m!(..);` is the arm's value only if the macro diverges, which a known one does by
+            // panicking and an unknown one may do by returning what it was given.
+            Some(Stmt::Macro(m)) => {
+                if diverges(&m.mac) {
+                    Ok(())
+                } else {
+                    Err(error(
+                        self.file,
+                        m.mac.path.span(),
+                        self.expected(&format!("`{}` ending the arm", snippet(&m.mac))),
+                    ))
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -1351,6 +1368,30 @@ impl<'ast> Visit<'ast> for Returns {
             visit::visit_arm(self, arm);
         }
     }
+
+    /// Nor is a `#[cfg(test)]` statement: a `let`, an expression statement or a macro.
+    fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+        if !is_test(&outer_attrs(stmt)) {
+            visit::visit_stmt(self, stmt);
+        }
+    }
+}
+
+/// A macro that never yields a value, so builds nothing: `panic!`, `unreachable!`, `todo!`, `unimplemented!`.
+fn diverges(mac: &Macro) -> bool {
+    ["panic", "unreachable", "todo", "unimplemented"]
+        .iter()
+        .any(|name| mac.path.is_ident(name))
+}
+
+/// The outer attributes of a statement, which `syn` keeps on whichever expression or item it holds.
+fn outer_attrs(stmt: &Stmt) -> Vec<Attribute> {
+    let leading = |input: ParseStream| -> syn::Result<Vec<Attribute>> {
+        let attrs = Attribute::parse_outer(input)?;
+        input.parse::<proc_macro2::TokenStream>()?;
+        Ok(attrs)
+    };
+    leading.parse2(stmt.to_token_stream()).unwrap_or_default()
 }
 
 fn mentions_return(tokens: proc_macro2::TokenStream) -> bool {
@@ -2202,6 +2243,70 @@ impl<T: PartialEq> Aggregate for FileManager<T> {
                 "DrawerCommand::Store(item) => Ok(vec![DrawerEvent::ItemStored(item)]),",
                 "DrawerCommand::Store(item) => match item {\n                #[cfg(test)]\n                _ => \
                  Ok(vec![DrawerEvent::Unlocked]),\n                _ => Ok(vec![DrawerEvent::ItemStored(item)]),\n            },",
+            );
+
+        let map = read(&drawer, POLICY).unwrap();
+        let plain = read(DRAWER, POLICY).unwrap();
+
+        assert_eq!(map.aggregates, plain.aggregates);
+    }
+
+    #[test]
+    fn a_repeated_section_adds_to_the_earlier_one() {
+        let source = r#"
+define_aggregate! {
+    Engine {
+        commands: { Start },
+        commands: { Stop },
+        events: { Started }
+    }
+}
+
+impl Aggregate for Engine {
+    async fn handle(&self, command: Self::Command, _: &()) -> R {
+        match command {
+            EngineCommand::Start => Ok(vec![EngineEvent::Started]),
+            EngineCommand::Stop => Err(AppError::conflict("never")),
+        }
+    }
+}
+"#;
+
+        let map = read_all(&[("engine.rs", source)]).unwrap();
+
+        assert_eq!(map.aggregates[0].commands, ["Start", "Stop"]);
+    }
+
+    #[test]
+    fn an_arm_ending_in_a_macro_statement_must_be_one_that_diverges() {
+        let read_arm = |arm: &str| {
+            let policy = HOUSEKEEPING.replace("_ => Vec::new(),", arm);
+            read_all(&[
+                ("cabinet.rs", CABINET),
+                ("drawer.rs", DRAWER),
+                ("p.rs", &policy),
+            ])
+            .map_err(|error| (error.line, line_of(&policy, "issue!")))
+        };
+
+        let error = read_arm("_ => { issue!(DrawerCommand::Lock); }").unwrap_err();
+        assert_eq!(error.0, error.1);
+        assert!(read_arm("_ => { unreachable!(\"never\"); }").is_ok());
+        assert!(read_arm("_ => unreachable!(),").is_ok());
+    }
+
+    #[test]
+    fn a_test_only_statement_returns_nothing() {
+        let drawer = DRAWER
+            .replace(
+                "            DrawerCommand::Fit { cabinet } => {\n",
+                "            DrawerCommand::Fit { cabinet } => {\n                #[cfg(test)]\n                if self.on \
+                 { return self.test_helper(); }\n                #[cfg(test)]\n                if self.on { return \
+                 Ok(vec![DrawerEvent::Unlocked]); }\n",
+            )
+            .replace(
+                "        match command {",
+                "        #[cfg(test)]\n        if self.on { return Ok(vec![DrawerEvent::Locked]); }\n        match command {",
             );
 
         let map = read(&drawer, POLICY).unwrap();

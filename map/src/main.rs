@@ -54,7 +54,9 @@ fn run(options: &Options) -> Result<(), String> {
     let out = options.out.display();
     if options.check {
         // A missing map is as stale as a wrong one.
-        if fs::read_to_string(&options.out).ok().as_deref() != Some(markdown.as_str()) {
+        // A checkout that turns the map's line endings into CRLF has not changed it.
+        let committed = fs::read_to_string(&options.out).map(|text| text.replace("\r\n", "\n"));
+        if committed.ok().as_deref() != Some(markdown.as_str()) {
             return Err(format!(
                 "{out} does not match the domain's source; rerun this command without `--check` to update it"
             ));

@@ -121,3 +121,15 @@ fn a_source_directory_that_cannot_be_read_fails_the_run_naming_it() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("nowhere: cannot read"));
 }
+
+#[test]
+fn check_passes_on_a_current_map_checked_out_with_crlf_line_endings() {
+    let dir = workspace("crlf");
+    assert!(replay_map(&dir, &["--out", "map.md"]).status.success());
+    let map = fs::read_to_string(dir.join("map.md")).unwrap();
+    fs::write(dir.join("map.md"), map.replace('\n', "\r\n")).unwrap();
+
+    assert!(replay_map(&dir, &["--out", "map.md", "--check"])
+        .status
+        .success());
+}
