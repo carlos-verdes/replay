@@ -89,15 +89,38 @@ pub struct SourceDirs<'a>(pub &'a [PathBuf]);
 
 impl Sources for SourceDirs<'_> {
     fn each(&self, visit: &mut dyn FnMut(&Source) -> Result<()>) -> Result<()> {
-        self.0.iter().try_for_each(|dir| each_in(dir, visit))
+        self.0.iter().try_for_each(|dir| each_in(dir, None, visit))
     }
 }
 
-fn each_in(dir: &Path, visit: &mut dyn FnMut(&Source) -> Result<()>) -> Result<()> {
+/// A directory being walked, and the ones it was reached through: a chain on the call stack, as deep as the walk.
+struct Walking<'a> {
+    real: PathBuf,
+    parent: Option<&'a Walking<'a>>,
+}
+
+fn each_in(
+    dir: &Path,
+    parent: Option<&Walking>,
+    visit: &mut dyn FnMut(&Source) -> Result<()>,
+) -> Result<()> {
+    let real = fs::canonicalize(dir).map_err(|e| unreadable(dir, e))?;
+    // A symbolic link back to a directory the walk is inside would read the same files forever.
+    if std::iter::successors(parent, |walking| walking.parent).any(|walking| walking.real == real) {
+        return Err(MapError {
+            file: dir.display().to_string(),
+            line: 0,
+            message: format!(
+                "links back to {}, which is already being read",
+                real.display()
+            ),
+        });
+    }
+    let walking = Walking { real, parent };
     let mut after = None;
     while let Some(path) = next_entry(dir, after.as_deref())? {
         if path.is_dir() {
-            each_in(&path, visit)?;
+            each_in(&path, Some(&walking), visit)?;
         } else if path.extension().is_some_and(|ext| ext == "rs") {
             let text = fs::read_to_string(&path).map_err(|e| unreadable(&path, e))?;
             visit(&Source {
@@ -951,7 +974,13 @@ fn tail_match<'a>(file: &str, imp: &'a ItemImpl, name: &str) -> Result<&'a ExprM
             format!("`fn {name}` in `impl ... for {}`", snippet(&imp.self_ty)),
         ));
     };
-    let (tail, before) = function.block.stmts.split_last().unzip();
+    // A `#[cfg(test)]` statement after the dispatch is not compiled outside test.
+    let stmts = &function.block.stmts;
+    let last = stmts.iter().rposition(|stmt| !is_test(&outer_attrs(stmt)));
+    let (tail, before) = match last {
+        Some(last) => (Some(&stmts[last]), &stmts[..last]),
+        None => (None, &stmts[..0]),
+    };
     let Some(Stmt::Expr(Expr::Match(m), None)) = tail else {
         return Err(error(
             file,
@@ -962,10 +991,7 @@ fn tail_match<'a>(file: &str, imp: &'a ItemImpl, name: &str) -> Result<&'a ExprM
     // A `return` before the dispatch, its scrutinee included, would decide outside any arm, where no command or event
     // names it.
     let mut returns = Returns::default();
-    before
-        .into_iter()
-        .flatten()
-        .for_each(|stmt| returns.visit_stmt(stmt));
+    before.iter().for_each(|stmt| returns.visit_stmt(stmt));
     returns.visit_expr(&m.expr);
     let early = returns.found.iter().map(Spanned::span);
     if let Some(early) = early.chain(returns.hidden.iter().copied()).next() {
@@ -1201,7 +1227,11 @@ impl Reader<'_> {
 
     /// The block's tail. Its `return`s are read by `exits`, from the arm or closure it belongs to.
     fn block(&self, block: &Block, out: &mut Vec<Ref>) -> Result<()> {
-        match block.stmts.last() {
+        match block
+            .stmts
+            .iter()
+            .rfind(|stmt| !is_test(&outer_attrs(stmt)))
+        {
             Some(Stmt::Expr(tail, None)) => self.expr(tail, out),
             // `syn` reads a trailing `vec! { .. }` as a statement, though it is the block's value.
             Some(Stmt::Macro(m)) if m.semi_token.is_none() => self.expr(
@@ -2307,6 +2337,30 @@ impl Aggregate for Engine {
             .replace(
                 "        match command {",
                 "        #[cfg(test)]\n        if self.on { return Ok(vec![DrawerEvent::Locked]); }\n        match command {",
+            );
+
+        let map = read(&drawer, POLICY).unwrap();
+        let plain = read(DRAWER, POLICY).unwrap();
+
+        assert_eq!(map.aggregates, plain.aggregates);
+    }
+
+    #[test]
+    fn a_test_only_tail_is_not_the_value_of_a_function_or_an_arm() {
+        let drawer = DRAWER
+            .replace(
+                "            DrawerCommand::Store(item) => Ok(vec![DrawerEvent::ItemStored(item)]),",
+                "            DrawerCommand::Store(item) => {\n                #[cfg(not(test))]\n                { \
+                 Ok(vec![DrawerEvent::ItemStored(item)]) }\n                #[cfg(test)]\n                { \
+                 self.test_helper() }\n            }",
+            )
+            .replace(
+                "        match command {",
+                "        #[cfg(not(test))]\n        match command {",
+            )
+            .replace(
+                "        }\n    }\n}\n",
+                "        }\n        #[cfg(test)]\n        match command { _ => self.test_helper() }\n    }\n}\n",
             );
 
         let map = read(&drawer, POLICY).unwrap();

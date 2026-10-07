@@ -133,3 +133,42 @@ fn check_passes_on_a_current_map_checked_out_with_crlf_line_endings() {
         .status
         .success());
 }
+
+#[test]
+fn an_option_given_where_a_path_belongs_is_refused_rather_than_written_to() {
+    let dir = workspace("option-as-path");
+
+    let output = replay_map(&dir, &["--out", "--check"]);
+
+    assert!(!output.status.success());
+    assert!(!dir.join("--check").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--out needs a file; found `--check`"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_back_to_a_directory_being_read_fails_the_run_naming_it() {
+    let dir = workspace("link-cycle");
+    std::os::unix::fs::symlink(".", dir.join("src/again")).unwrap();
+
+    let output = replay_map(&dir, &[]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("src/again: links back to"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_to_a_directory_outside_the_walk_is_followed() {
+    let dir = workspace("link-out");
+    fs::create_dir_all(dir.join("shared")).unwrap();
+    let lamp = DOMAIN.replace("Light", "Lamp");
+    fs::write(dir.join("shared/lamp.rs"), lamp).unwrap();
+    std::os::unix::fs::symlink("../shared", dir.join("src/shared")).unwrap();
+
+    assert!(replay_map(&dir, &[]).status.success());
+
+    let map = fs::read_to_string(dir.join("docs/domain-map.md")).unwrap();
+    assert!(map.contains("cmd-Lamp-Switch --> evt-Lamp-Switched"));
+}

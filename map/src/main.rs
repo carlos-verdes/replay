@@ -34,8 +34,8 @@ fn options() -> Result<Options, String> {
         match arg.as_str() {
             "--src" => options
                 .sources
-                .push(args.next().ok_or("--src needs a directory")?.into()),
-            "--out" => options.out = args.next().ok_or("--out needs a file")?.into(),
+                .push(value(&mut args, "--src", "a directory")?.into()),
+            "--out" => options.out = value(&mut args, "--out", "a file")?.into(),
             "--check" => options.check = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unexpected argument `{other}`")),
@@ -45,6 +45,20 @@ fn options() -> Result<Options, String> {
         options.sources.push(PathBuf::from("src"));
     }
     Ok(options)
+}
+
+/// An option's value. One that looks like an option is a forgotten value: `--out --check` must not write a file named
+/// `--check`. A path that does start with `-` can be passed as `./-name`.
+fn value(
+    args: &mut impl Iterator<Item = String>,
+    option: &str,
+    what: &str,
+) -> Result<String, String> {
+    match args.next() {
+        Some(value) if !value.starts_with('-') => Ok(value),
+        Some(value) => Err(format!("{option} needs {what}; found `{value}`")),
+        None => Err(format!("{option} needs {what}")),
+    }
 }
 
 fn run(options: &Options) -> Result<(), String> {
