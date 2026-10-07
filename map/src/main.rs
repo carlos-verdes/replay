@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::{env, fs};
 
-use replay_map::{read_sources, DomainMap};
+use replay_map::{DomainMap, SourceDirs};
 
 const USAGE: &str = "usage: cargo replay-map [--src <dir>]... [--out <file>] [--check]
 
@@ -48,12 +48,7 @@ fn options() -> Result<Options, String> {
 }
 
 fn run(options: &Options) -> Result<(), String> {
-    let mut sources = Vec::new();
-    for dir in &options.sources {
-        sources
-            .extend(read_sources(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?);
-    }
-    let markdown = DomainMap::read(&sources)
+    let markdown = DomainMap::read(&SourceDirs(&options.sources))
         .map_err(|e| e.to_string())?
         .to_markdown();
     let out = options.out.display();

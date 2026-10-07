@@ -14,10 +14,9 @@
 //! generator cannot read fails with `file:line`; nothing is skipped.
 //!
 //! ```no_run
-//! use replay_map::{DomainMap, read_sources};
+//! use replay_map::{DomainMap, SourceDirs};
 //!
-//! let sources = read_sources(std::path::Path::new("src"))?;
-//! let markdown = DomainMap::read(&sources)?.to_markdown();
+//! let markdown = DomainMap::read(&SourceDirs(&["src".into()]))?.to_markdown();
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -50,7 +49,11 @@ impl std::error::Error for MapError {}
 
 impl fmt::Display for MapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: {}", self.file, self.line, self.message)
+        match self.line {
+            // A file or directory that could not be read has no line to point at.
+            0 => write!(f, "{}: {}", self.file, self.message),
+            line => write!(f, "{}:{line}: {}", self.file, self.message),
+        }
     }
 }
 
@@ -62,29 +65,71 @@ pub struct Source {
     pub text: String,
 }
 
-/// Every `.rs` file under `dir`, in path order so the map does not depend on the file system's.
-pub fn read_sources(dir: &Path) -> std::io::Result<Vec<Source>> {
-    let mut out = Vec::new();
-    collect(dir, &mut out)?;
-    Ok(out)
+/// Where a domain's source comes from. `DomainMap::read` walks it once per pass and holds one file's text at a time,
+/// so a source tree is never in memory whole.
+pub trait Sources {
+    /// Hands every source file to `visit`, in the same order on every call.
+    fn each(
+        &self,
+        visit: &mut dyn FnMut(&Source) -> std::result::Result<(), MapError>,
+    ) -> std::result::Result<(), MapError>;
 }
 
-fn collect(dir: &Path, out: &mut Vec<Source>) -> std::io::Result<()> {
-    let mut paths = fs::read_dir(dir)?
-        .map(|entry| entry.map(|e| e.path()))
-        .collect::<std::io::Result<Vec<PathBuf>>>()?;
-    paths.sort();
-    for path in paths {
+/// Sources already in memory: the caller's, and the caller's to bound.
+impl Sources for [Source] {
+    fn each(&self, visit: &mut dyn FnMut(&Source) -> Result<()>) -> Result<()> {
+        self.iter().try_for_each(visit)
+    }
+}
+
+/// Every `.rs` file under these directories, in path order so the map does not depend on the file system's, read
+/// from disk again on every pass.
+pub struct SourceDirs<'a>(pub &'a [PathBuf]);
+
+impl Sources for SourceDirs<'_> {
+    fn each(&self, visit: &mut dyn FnMut(&Source) -> Result<()>) -> Result<()> {
+        self.0.iter().try_for_each(|dir| each_in(dir, visit))
+    }
+}
+
+fn each_in(dir: &Path, visit: &mut dyn FnMut(&Source) -> Result<()>) -> Result<()> {
+    let mut after = None;
+    while let Some(path) = next_entry(dir, after.as_deref())? {
         if path.is_dir() {
-            collect(&path, out)?;
+            each_in(&path, visit)?;
         } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(Source {
-                text: fs::read_to_string(&path)?,
+            let text = fs::read_to_string(&path).map_err(|e| unreadable(&path, e))?;
+            visit(&Source {
                 path: path.display().to_string(),
-            });
+                text,
+            })?;
         }
+        after = Some(path);
     }
     Ok(())
+}
+
+/// The first entry of `dir` in path order after `after`. Rescanning the directory for each entry costs time
+/// quadratic in one directory's size, and holds one path instead of its listing.
+fn next_entry(dir: &Path, after: Option<&Path>) -> Result<Option<PathBuf>> {
+    let mut next: Option<PathBuf> = None;
+    for entry in fs::read_dir(dir).map_err(|e| unreadable(dir, e))? {
+        let path = entry.map_err(|e| unreadable(dir, e))?.path();
+        if after.is_none_or(|after| path.as_path() > after)
+            && next.as_ref().is_none_or(|next| path < *next)
+        {
+            next = Some(path);
+        }
+    }
+    Ok(next)
+}
+
+fn unreadable(path: &Path, e: std::io::Error) -> MapError {
+    MapError {
+        file: path.display().to_string(),
+        line: 0,
+        message: format!("cannot read: {e}"),
+    }
 }
 
 /// `(aggregate, variant)`: a command or event, named with the aggregate that declares it.
@@ -113,12 +158,12 @@ pub struct DomainMap {
 }
 
 impl DomainMap {
-    /// Each pass parses one file at a time and drops its syntax tree before the next, so the trees held at once are
-    /// bounded by the largest file rather than the domain; reparsing costs CPU, not memory.
-    pub fn read(sources: &[Source]) -> Result<Self> {
+    /// Each pass reads and parses one file at a time and drops it before the next, so what is held at once is
+    /// bounded by the largest file rather than the domain; rereading costs time, not memory.
+    pub fn read<S: Sources + ?Sized>(sources: &S) -> Result<Self> {
         // A `#[cfg(test)] mod tests;` keeps its items in another file, which `walk` never sees the attribute of.
         let mut modules = Vec::new();
-        for source in sources {
+        sources.each(&mut |source| {
             let file = parse(source)?;
             let dir = Path::new(&source.path).parent().unwrap_or(Path::new(""));
             out_of_line_modules(
@@ -128,24 +173,23 @@ impl DomainMap {
                 false,
                 &mut modules,
             );
-        }
-        let domain = || {
-            sources
-                .iter()
-                .filter(|source| !test_only(&modules, &normalize(Path::new(&source.path))))
-        };
+            Ok(())
+        })?;
+        let in_domain = |source: &Source| !test_only(&modules, &normalize(Path::new(&source.path)));
         // Declarations first: a policy's arms can only be read once every `query_events!` wrapper is known.
         let mut scan = Scan::default();
-        for source in domain() {
-            walk(&parse(source)?.items, &mut |item| {
+        sources.each(&mut |source| match in_domain(source) {
+            true => walk(&parse(source)?.items, &mut |item| {
                 scan.declaration(&source.path, item)
-            })?;
-        }
-        for source in domain() {
-            walk(&parse(source)?.items, &mut |item| {
+            }),
+            false => Ok(()),
+        })?;
+        sources.each(&mut |source| match in_domain(source) {
+            true => walk(&parse(source)?.items, &mut |item| {
                 scan.behaviour(&source.path, item)
-            })?;
-        }
+            }),
+            false => Ok(()),
+        })?;
         scan.assemble()
     }
 
@@ -1326,7 +1370,7 @@ impl Policy for Housekeeping {
                 text: text.to_string(),
             })
             .collect();
-        DomainMap::read(&sources)
+        DomainMap::read(sources.as_slice())
     }
 
     fn read(drawer: &str, policy: &str) -> Result<DomainMap> {

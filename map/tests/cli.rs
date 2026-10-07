@@ -94,3 +94,30 @@ fn an_unreadable_arm_fails_the_run_with_its_file_and_line() {
         + 1;
     assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("light.rs:{line}:")));
 }
+
+#[test]
+fn files_are_read_in_path_order_through_nested_directories() {
+    let dir = workspace("order");
+    let unreadable = DOMAIN.replace("Ok(vec![LightEvent::Switched])", "self.switch()");
+    fs::create_dir_all(dir.join("src/a")).unwrap();
+    fs::write(dir.join("src/a/z.rs"), &unreadable).unwrap();
+    fs::write(dir.join("src/b.rs"), &unreadable).unwrap();
+
+    let output = replay_map(&dir, &[]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("{}:", Path::new("src/a/z.rs").display())),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_source_directory_that_cannot_be_read_fails_the_run_naming_it() {
+    let dir = workspace("missing");
+
+    let output = replay_map(&dir, &["--src", "nowhere"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("nowhere: cannot read"));
+}
