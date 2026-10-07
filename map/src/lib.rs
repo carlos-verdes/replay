@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use proc_macro2::{Delimiter, Span, TokenTree};
 use quote::ToTokens;
+use syn::ext::IdentExt;
 use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
@@ -171,25 +172,30 @@ impl DomainMap {
                 &file.items,
                 dir,
                 &children_dir(Path::new(&source.path)),
-                false,
+                // A file-level `#![cfg(test)]` gates every module the file declares.
+                is_test(&file.attrs),
                 &mut modules,
             );
             Ok(())
         })?;
-        let in_domain = |source: &Source| !test_only(&modules, &normalize(Path::new(&source.path)));
+        let domain_file = |source: &Source| -> Result<Option<syn::File>> {
+            if test_only(&modules, &normalize(Path::new(&source.path))) {
+                return Ok(None);
+            }
+            let file = parse(source)?;
+            Ok((!is_test(&file.attrs)).then_some(file))
+        };
         // Declarations first: a policy's arms can only be read once every `query_events!` wrapper is known.
         let mut scan = Scan::default();
-        sources.each(&mut |source| match in_domain(source) {
-            true => walk(&parse(source)?.items, &mut |item| {
+        sources.each(&mut |source| match domain_file(source)? {
+            Some(file) => walk(&file.items, &mut |item| {
                 scan.declaration(&source.path, item)
             }),
-            false => Ok(()),
+            None => Ok(()),
         })?;
-        sources.each(&mut |source| match in_domain(source) {
-            true => walk(&parse(source)?.items, &mut |item| {
-                scan.behaviour(&source.path, item)
-            }),
-            false => Ok(()),
+        sources.each(&mut |source| match domain_file(source)? {
+            Some(file) => walk(&file.items, &mut |item| scan.behaviour(&source.path, item)),
+            None => Ok(()),
         })?;
         scan.assemble()
     }
@@ -276,11 +282,10 @@ fn event_id(aggregate: &str, event: &str) -> String {
 }
 
 /// Joined with `-`, which no Rust identifier contains, so two different name pairs never share a node: `_` would
-/// make aggregate `A_B` with command `C` collide with aggregate `A` and command `B_C`. A raw identifier drops its
-/// `r#`, which Mermaid cannot read.
+/// make aggregate `A_B` with command `C` collide with aggregate `A` and command `B_C`.
 fn node_id(kind: &str, names: &[&str]) -> String {
     std::iter::once(kind)
-        .chain(names.iter().map(|name| name.trim_start_matches("r#")))
+        .chain(names.iter().copied())
         .collect::<Vec<_>>()
         .join("-")
 }
@@ -447,8 +452,6 @@ fn out_of_line_modules(
     gated: bool,
     out: &mut Vec<Module>,
 ) {
-    use syn::ext::IdentExt;
-
     for item in items {
         let Item::Mod(m) = item else { continue };
         let test = gated || is_test(&m.attrs);
@@ -551,12 +554,12 @@ impl Scan {
             .as_ref()
             .and_then(|(_, path, _)| path.segments.last())
         {
-            Some(t) if t.ident == "Aggregate" => self.handles.push(handle(file, imp)?),
-            Some(t) if t.ident == "AggregatePolicy" => {
+            Some(t) if ident_name(&t.ident) == "Aggregate" => self.handles.push(handle(file, imp)?),
+            Some(t) if ident_name(&t.ident) == "AggregatePolicy" => {
                 let policy = policy(file, imp, &self.wrappers, true)?;
                 self.policies.push(policy);
             }
-            Some(t) if t.ident == "Policy" => {
+            Some(t) if ident_name(&t.ident) == "Policy" => {
                 let policy = policy(file, imp, &self.wrappers, false)?;
                 self.policies.push(policy);
             }
@@ -698,10 +701,16 @@ fn is_test(attrs: &[Attribute]) -> bool {
     })
 }
 
+/// An identifier as the type system reads it: `r#Light` and `Light` are one name, and the macro builds `LightCommand`
+/// from either.
+fn ident_name(ident: &Ident) -> String {
+    ident.unraw().to_string()
+}
+
 fn is_named(path: &syn::Path, name: &str) -> bool {
     path.segments
         .last()
-        .is_some_and(|segment| segment.ident == name)
+        .is_some_and(|segment| ident_name(&segment.ident) == name)
 }
 
 fn snippet(tokens: &impl ToTokens) -> String {
@@ -745,7 +754,7 @@ fn aggregate(file: &str, mac: &Macro) -> Result<Located<AggregateDef>> {
                 }
                 value.push(token);
             }
-            let slot = match key.to_string().as_str() {
+            let slot = match ident_name(&key).as_str() {
                 "commands" => Some(&mut commands),
                 "events" => Some(&mut events),
                 _ => None,
@@ -761,12 +770,11 @@ fn aggregate(file: &str, mac: &Macro) -> Result<Located<AggregateDef>> {
                 body.parse::<Token![,]>()?;
             }
         }
-        let missing =
-            |what: &str| syn::Error::new(name.span(), format!("`{what}: {{ .. }}` in `{name}`"));
+        // The macro defaults an omitted section to an empty list.
         Ok(AggregateDef {
-            commands: commands.ok_or_else(|| missing("commands"))?,
-            events: events.ok_or_else(|| missing("events"))?,
-            name: name.to_string(),
+            commands: commands.unwrap_or_default(),
+            events: events.unwrap_or_default(),
+            name: ident_name(&name),
         })
     };
     let def = parser.parse2(mac.tokens.clone()).map_err(|e| {
@@ -796,7 +804,7 @@ fn variant_names(input: ParseStream) -> syn::Result<Vec<String>> {
         if input.peek(Token![,]) {
             input.parse::<Token![,]>()?;
         }
-        names.push(name.to_string());
+        names.push(ident_name(&name));
     }
     Ok(names)
 }
@@ -813,7 +821,7 @@ fn wrapper(file: &str, mac: &Macro) -> Result<(String, Vec<String>)> {
             .iter()
             .map(|ty| type_name(ty).ok_or_else(|| syn::Error::new(ty.span(), "a named event type")))
             .collect::<syn::Result<_>>()?;
-        Ok((name.to_string(), members))
+        Ok((ident_name(&name), members))
     };
     parser.parse2(mac.tokens.clone()).map_err(|e| {
         error(
@@ -854,7 +862,7 @@ fn policy(
         imp.items
             .iter()
             .find_map(|item| match item {
-                ImplItem::Type(t) if t.ident == wanted => type_name(&t.ty),
+                ImplItem::Type(t) if ident_name(&t.ident) == wanted => type_name(&t.ty),
                 _ => None,
             })
             .ok_or_else(|| {
@@ -916,7 +924,7 @@ fn type_name(ty: &Type) -> Option<String> {
             .path
             .segments
             .last()
-            .map(|segment| segment.ident.to_string()),
+            .map(|segment| ident_name(&segment.ident)),
         _ => None,
     }
 }
@@ -924,7 +932,7 @@ fn type_name(ty: &Type) -> Option<String> {
 /// The `match` that `fn <name>` ends in.
 fn tail_match<'a>(file: &str, imp: &'a ItemImpl, name: &str) -> Result<&'a ExprMatch> {
     let function = imp.items.iter().find_map(|item| match item {
-        ImplItem::Fn(f) if f.sig.ident == name => Some(f),
+        ImplItem::Fn(f) if ident_name(&f.sig.ident) == name => Some(f),
         _ => None,
     });
     let Some(function) = function else {
@@ -1056,8 +1064,8 @@ fn variants(
 fn variant_of(path: &syn::Path, prefix: &str) -> Option<String> {
     let segments: Vec<_> = path.segments.iter().collect();
     match segments.as_slice() {
-        [head, variant] if head.ident == prefix && head.arguments.is_none() => {
-            Some(variant.ident.to_string())
+        [head, variant] if ident_name(&head.ident) == prefix && head.arguments.is_none() => {
+            Some(ident_name(&variant.ident))
         }
         _ => None,
     }
@@ -1069,7 +1077,7 @@ fn path_of(expr: &Expr) -> Option<Vec<String>> {
             p.path
                 .segments
                 .iter()
-                .map(|s| s.ident.to_string())
+                .map(|s| ident_name(&s.ident))
                 .collect(),
         ),
         _ => None,
@@ -1142,11 +1150,7 @@ impl Reader<'_> {
                 let items = Punctuated::<Expr, Token![,]>::parse_terminated
                     .parse2(m.mac.tokens.clone())
                     .map_err(|_| self.unreadable(expr))?;
-                // The `Returns` that read the arm cannot see into the macro's tokens.
-                items.iter().try_for_each(|item| {
-                    self.exits(item, out)?;
-                    self.expr(item, out)
-                })
+                items.iter().try_for_each(|item| self.expr(item, out))
             }
             Expr::MethodCall(call) => match call.method.to_string().as_str() {
                 "collect" | "unwrap_or_default" if call.args.is_empty() => {
@@ -1198,10 +1202,7 @@ impl Reader<'_> {
     fn exits(&self, expr: &Expr, out: &mut Vec<Ref>) -> Result<()> {
         let mut returns = Returns(Vec::new());
         returns.visit_expr(expr);
-        returns
-            .0
-            .into_iter()
-            .try_for_each(|r| self.returned(r, out))
+        returns.0.iter().try_for_each(|r| self.returned(r, out))
     }
 
     fn returned(&self, r: &ExprReturn, out: &mut Vec<Ref>) -> Result<()> {
@@ -1244,7 +1245,7 @@ impl Reader<'_> {
                 self.1 |= path
                     .segments
                     .first()
-                    .is_some_and(|segment| segment.ident == self.0);
+                    .is_some_and(|segment| ident_name(&segment.ident) == self.0);
                 visit::visit_path(self, path);
             }
         }
@@ -1284,13 +1285,33 @@ impl Reader<'_> {
     }
 }
 
-/// The `return`s that leave the function being read: not those of a closure or a nested item.
-struct Returns<'ast>(Vec<&'ast ExprReturn>);
+/// The `return`s that leave the function being read: not those of a closure or a nested item. A `vec!`'s elements are
+/// parsed and searched too, wherever it stands, since a macro's tokens are otherwise opaque to the visitor.
+struct Returns(Vec<ExprReturn>);
 
-impl<'ast> Visit<'ast> for Returns<'ast> {
+impl<'ast> Visit<'ast> for Returns {
     fn visit_expr_return(&mut self, r: &'ast ExprReturn) {
-        self.0.push(r);
+        self.0.push(r.clone());
         visit::visit_expr_return(self, r);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast Macro) {
+        if !mac.path.is_ident("vec") {
+            return;
+        }
+        let repeated = |input: ParseStream| -> syn::Result<[Expr; 2]> {
+            let element: Expr = input.parse()?;
+            input.parse::<Token![;]>()?;
+            Ok([element, input.parse()?])
+        };
+        match Punctuated::<Expr, Token![,]>::parse_terminated.parse2(mac.tokens.clone()) {
+            Ok(items) => items.iter().for_each(|item| self.visit_expr(item)),
+            Err(_) => {
+                if let Ok(items) = repeated.parse2(mac.tokens.clone()) {
+                    items.iter().for_each(|item| self.visit_expr(item));
+                }
+            }
+        }
     }
 
     fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
@@ -1898,6 +1919,114 @@ impl Aggregate for Ledger {
         let error = read(&drawer, POLICY).unwrap_err();
 
         assert_eq!(error.line, line_of(&drawer, "return self.unlock()"));
+    }
+
+    #[test]
+    fn a_file_gated_from_inside_is_skipped_with_the_modules_it_declares() {
+        let unreadable = "impl Aggregate for X { async fn handle(&self) -> R { helper() } }";
+        let tests = format!("#![cfg(test)]\nmod fixtures;\n{unreadable}\n");
+
+        let map = read_all(&[
+            ("src/lib.rs", "mod cabinet;\nmod tests;\n"),
+            ("src/cabinet.rs", CABINET),
+            ("src/tests.rs", &tests),
+            ("src/tests/fixtures.rs", unreadable),
+        ])
+        .unwrap();
+
+        assert_eq!(map.aggregates.len(), 1);
+    }
+
+    #[test]
+    fn a_raw_identifier_names_the_same_aggregate_and_variant_as_its_plain_spelling() {
+        let source = r#"
+define_aggregate! {
+    r#Light {
+        commands: { r#Switch },
+        events: { Switched }
+    }
+}
+
+impl Aggregate for Light {
+    async fn handle(&self, command: Self::Command, _: &()) -> R {
+        match command {
+            r#LightCommand::Switch => Ok(vec![LightEvent::r#Switched]),
+        }
+    }
+}
+"#;
+
+        let map = read_all(&[("light.rs", source)]).unwrap();
+
+        assert_eq!(map.aggregates[0].name, "Light");
+        assert_eq!(map.aggregates[0].decisions, refs(&[("Switch", "Switched")]));
+        assert!(map
+            .to_markdown()
+            .contains("cmd-Light-Switch --> evt-Light-Switched"));
+    }
+
+    #[test]
+    fn an_omitted_section_is_an_empty_one() {
+        let source = r#"
+define_aggregate! {
+    Gate {
+        commands: { Refuse }
+    }
+}
+
+impl Aggregate for Gate {
+    async fn handle(&self, command: Self::Command, _: &()) -> R {
+        match command {
+            GateCommand::Refuse => Err(AppError::conflict("never")),
+        }
+    }
+}
+"#;
+
+        let map = read_all(&[("gate.rs", source)]).unwrap();
+
+        assert_eq!(map.aggregates[0].commands, ["Refuse"]);
+        assert!(map.aggregates[0].events.is_empty());
+    }
+
+    #[test]
+    fn a_return_inside_a_vec_outside_result_position_is_still_read() {
+        let read_arm = |arm: &str| {
+            let policy = HOUSEKEEPING.replace("_ => Vec::new(),", arm);
+            let error = read_all(&[
+                ("cabinet.rs", CABINET),
+                ("drawer.rs", DRAWER),
+                ("p.rs", &policy),
+            ])
+            .unwrap_err();
+            (error.line, line_of(&policy, "let _ = vec!["))
+        };
+
+        // Through a helper: unreadable.
+        let (line, expected) = read_arm(
+            "_ => { let _ = vec![{ if self.enabled { return self.reseal(); } 0u8 }]; Vec::new() }",
+        );
+        assert_eq!(line, expected);
+        // Inline: a command a `_` arm may not issue.
+        let (line, expected) = read_arm(
+            "_ => { let _ = vec![{ if self.enabled { return vec![Dispatch::to::<Cabinet>(c(), CabinetCommand::Seal)]; } \
+             0u8 }]; Vec::new() }",
+        );
+        assert_eq!(line, expected);
+    }
+
+    #[test]
+    fn a_return_inside_a_vec_before_the_dispatch_fails_at_its_line() {
+        let early =
+            "let _ = vec![{ if self.locked { return Ok(vec![DrawerEvent::Locked]); } 0u8 }];";
+        let drawer = DRAWER.replace(
+            "        match command {",
+            &format!("        {early}\n        match command {{"),
+        );
+
+        let error = read(&drawer, POLICY).unwrap_err();
+
+        assert_eq!(error.line, line_of(&drawer, early));
     }
 
     #[test]
