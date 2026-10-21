@@ -106,21 +106,28 @@ sit in Unseen until they end, find no events, and delay no delivery.
 The full comparison, narrowed by #267, runs:
 
 - **when a leader starts**, because in-memory state does not survive a restart, a
-  failover, a restore or a cluster move (subject to the start-up offset of #269);
-- **on a manual drain**, as today;
-- **on `REPLAY_POLICY_RECONCILE_SECS`**, whose default becomes **300 s**. Its job is
-  self-healing after a defect, not delivery. Deployments that set it keep their value.
+  failover, a restore or a cluster move. Each Policy's start-up comparison is spread over
+  the leader's first few polls (#269), not over the cadence below. A failover therefore
+  costs seconds, and the Policies still do not all scan in the same moment;
+- **when requested**: on a manual drain, as today, and when the late-write state is
+  cleared (cap exceeded, counter moved backwards). It runs on the next poll;
+- **on `REPLAY_POLICY_RECONCILE_SECS`**, whose default becomes **300 s**. By then every
+  known case is covered by one of the above, so this cadence only bounds how long a defect
+  nobody has detected can hide a late write. In normal operation it finds nothing. It is a
+  cost knob, not a delivery promise. Deployments that set it keep their value.
 
 ## Consequences
 
 - **The delivery bound for a late write becomes two bounds.**
   - *Through Replay, with the leader unchanged:* nominated on the first poll after its
     transaction ends, and read in that poll, which it leads.
-  - *Otherwise* (leader start, cluster move, cap overflow, a defect): within one
-    safety-net cadence, plus ADR-0026's rotation terms.
+  - *When the late-write state is lost or cleared* (leader start, cluster move, cap
+    overflow): found by the requested or start-up full comparison, within the leader's
+    first few polls, plus ADR-0026's rotation terms.
+  - *A defect nobody has detected*: within one safety-net cadence (300 s by default).
 
   The first is what an operator sees; the second is the edge case, slower and still
-  correct.
+  correct; the third is what the safety net exists for.
 - **The cost of finding a late write is proportional to new events.** Each poll scans
   the stamp range assigned since the previous sweep, plus one indexed lookup per ended
   transaction. The full comparison runs at leader start and every few minutes.
@@ -128,7 +135,7 @@ The full comparison, narrowed by #267, runs:
 
   | Case | What happens |
   |---|---|
-  | Restart, failover, leader change | State is lost; the new leader's full comparison finds what was in flight. |
+  | Restart, failover, leader change | State is lost; the new leader's start-up comparison, within its first few polls, finds what was in flight. |
   | PITR, replica promotion | These keep the transaction counter; state is lost with the process; as above. |
   | Logical move (`pg_dump`/`pg_restore`, logical replication, blue/green) | The counter resets (#215). If it moves backwards (`xmax(now) < Tail`), the Policy clears its state and requests a full comparison. Restored stamps from the old cluster can collide with new ids; that causes spurious nominations, each bounded by the read batch, and a nominated stream that is caught up reads nothing. |
   | A long transaction elsewhere on the server (#214) | Held in Unseen, harmless; nothing waits for it. |
