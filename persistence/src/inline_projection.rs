@@ -40,12 +40,32 @@ pub trait InlineProjection: Send + Sync {
     /// Returned filter narrows which streams/events the store scans during either
     /// replay, so unrelated history is not read. Defaults to [`StreamFilter::All`].
     ///
+    /// The live append does not apply it, and neither does the catch-up that stands in
+    /// for the live append of a process without this projection (ADR-0032); to narrow
+    /// those, declare [`event_types`](Self::event_types).
+    ///
     /// Whatever the filter, a replay reads the true log (ADR-0004): archived
     /// originals and the real events appended after a compaction, never compaction
     /// snapshots. A rebuild therefore reproduces what the projection saw live, since
     /// compaction never runs inline projections.
     fn stream_filter(&self) -> StreamFilter {
         StreamFilter::All
+    }
+
+    /// The event `type`s this projection handles, as [`Event::event_type`] wrote them.
+    ///
+    /// `None`, the default, routes every event by deserialize-or-skip (ADR-0002).
+    /// `Some(types)` narrows every path that feeds [`handle`](Self::handle) — the live
+    /// append, the rebuild replay and the catch-up — to events of those types before
+    /// anything is deserialized, so the three agree on the types they deliver and a replay
+    /// or catch-up scan reads only those types
+    /// ([ADR-0032](https://github.com/funkode-io/replay/blob/main/docs/adr/0032-an-inline-projection-catches-up-on-transactions-that-did-not-apply-it.md)).
+    ///
+    /// List every type the projection's [`Event`](Self::Event) can hold: an event of a
+    /// type left out never reaches `handle`. For a derived event enum that is each
+    /// variant's name.
+    fn event_types(&self) -> Option<Vec<String>> {
+        None
     }
 
     /// Create the projection's view table and any supporting schema.
@@ -110,6 +130,8 @@ pub(crate) trait ErasedInlineProjection: Send + Sync {
 
     fn stream_filter(&self) -> StreamFilter;
 
+    fn event_types(&self) -> Option<Vec<String>>;
+
     fn init<'a>(&'a mut self, conn: &'a mut Self::Exec)
         -> BoxFuture<'a, Result<(), replay::Error>>;
 
@@ -121,9 +143,10 @@ pub(crate) trait ErasedInlineProjection: Send + Sync {
 
     /// Route raw appended events to the underlying typed projection.
     ///
-    /// Each event's JSON `data` is deserialized *by borrow* into the projection's event
-    /// type; events that do not match are skipped. If no events match, the underlying
-    /// `handle` is not called.
+    /// Events of a type outside [`event_types`](InlineProjection::event_types), when the
+    /// projection declares them, are skipped first. Each remaining event's JSON `data` is
+    /// deserialized *by borrow* into the projection's event type; events that do not
+    /// match are skipped. If no events match, the underlying `handle` is not called.
     fn handle<'a>(
         &'a mut self,
         conn: &'a mut Self::Exec,
@@ -149,6 +172,10 @@ where
         InlineProjection::stream_filter(self)
     }
 
+    fn event_types(&self) -> Option<Vec<String>> {
+        InlineProjection::event_types(self)
+    }
+
     fn init<'a>(
         &'a mut self,
         conn: &'a mut Self::Exec,
@@ -169,6 +196,11 @@ where
         events: &'a [PersistedEvent<Value>],
     ) -> BoxFuture<'a, Result<(), replay::Error>> {
         Box::pin(async move {
+            // Declared types first: an event of another type is never deserialized. The
+            // replay and catch-up scans already filter on them in SQL; the live append is
+            // what this check is for.
+            let types = InlineProjection::event_types(self);
+
             // Deserialize-or-skip: keep only events that belong to this projection.
             //
             // `&serde_json::Value` is itself a `Deserializer`, so the payload is read by
@@ -178,6 +210,11 @@ where
             // the batch is not duplicated once per registered projection.
             let typed: Vec<PersistedEvent<T::Event>> = events
                 .iter()
+                .filter(|event| {
+                    types
+                        .as_ref()
+                        .is_none_or(|types| types.contains(&event.r#type))
+                })
                 .filter_map(|event| {
                     let data = T::Event::deserialize(&event.data).ok()?;
                     Some(event.with_data_from(data))
