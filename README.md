@@ -2258,6 +2258,77 @@ time and no database snapshot between them; a caller that pages across requests 
 `.take(n)` and resumes with `after` set to the last id it saw
 ([ADR-0029](docs/adr/0029-the-public-api-is-stream-first.md)).
 
+## Deleting streams
+
+Compaction keeps a stream and shortens it. When a stream must be **gone** — a catalog
+entry hard-deleted, say, whose id is a name slug that a later entry of the same name
+will take again — `PostgresEventStore::delete_streams` deletes it with everything the
+library keeps about it, in one transaction, and lets you delete your own read-model rows
+in that same transaction:
+
+```rust,ignore
+use urn::Urn;
+
+let deleted = store
+    .delete_streams(&[brand_id.into()], |conn, ids| {
+        Box::pin(async move {
+            let ids: Vec<String> = ids.iter().map(Urn::to_string).collect();
+            sqlx::query("DELETE FROM brand_view WHERE stream_id = ANY($1)")
+                .bind(&ids)
+                .execute(&mut *conn)
+                .await
+                .map_err(replay_persistence::db_error)?;
+            Ok(())
+        })
+    })
+    .await?;
+println!("deleted {} event(s), {} dead letter(s)", deleted.events, deleted.dead_letters);
+```
+
+What goes, for each id:
+
+- the stream and all of its events, the archived versions of a compacted stream included;
+- every Policy's [place](#how-a-policy-tracks-where-it-is) in it, so a stream created
+  later under the same id is delivered from its first event — left behind, the old place
+  would skip the new stream's events up to wherever the Policy had got in the old one;
+- every parked dead letter whose triggering event was one of those events, deleted
+  rather than archived: a deletion is a cleanup, and a dead letter whose event is gone
+  can never be retried. Dead letters that had already left the active set stay in the
+  archive as history. A dead letter *addressed to* the stream by an event of another
+  stream stays, since its trigger is still there;
+- whatever your closure deletes. An inline projection cannot see a delete — it is handed
+  events, and a deletion is not one — so its rows, and any other read model you keep, are
+  yours to delete here. The closure runs before the library's own deletes, so the streams
+  and their events can still be read from it; if it returns an error, nothing is
+  deleted.
+
+Only streams that exist when the deletion locks them are deleted or handed to the
+closure. An id with no stream is ignored, even if a stream is created under it while the
+deletion runs: the closure never saw that stream, so its events are left whole. An empty
+list returns at once without calling the closure; a non-empty list naming no stream calls
+it with an empty slice.
+
+A stream created again under a deleted id is a new stream: numbered from 1, delivered to
+Policies from its first event, and applied to inline projections — live, or by a
+[catch-up](#rolling-deploys-catching-up-on-appends-that-did-not-apply-it) — like any
+other. Running Policies need not be stopped: a Policy never writes a place or parks a
+dead letter for an event a deletion has taken, though a reaction already running when the
+deletion starts runs to its end. The deletion waits for an append to the stream that is
+in flight, and for a catch-up or a build of any inline projection, whichever process
+registered it; those waits, and your closure's, are bounded by the
+[stream lock wait](#stream-lock-wait).
+
+**Upgrade every process before the first deletion.** What keeps a running Policy, a
+catch-up and a build from writing for a deleted stream is in this release, on their side:
+a Policy runner of an earlier release can still write a place or park a dead letter for a
+stream after its deletion, and an earlier release registering an inline projection for the
+first time can still write view rows for it. Do not call `delete_streams` until every
+process that runs a Policy runner or registers an inline projection runs this release, or
+the ones that do not are stopped.
+
+Why a deletion takes what it takes, and what it leaves:
+[ADR-0033](docs/adr/0033-a-deleted-stream-takes-what-replay-keeps-about-it.md).
+
 ## Policies
 
 A `Policy` is a checkpointed background subscriber that **reacts to events by
@@ -3240,7 +3311,9 @@ CREATE INDEX IF NOT EXISTS idx_discarded_dead_letters_policy
 
 `superseded` is the third way out, and the only one no operator asked for: the
 duplicate generations the dedupe migration retired when a parked command became
-unique.
+unique. A [stream deletion](#deleting-streams) is the one exit that archives nothing:
+it is a cleanup, and deletes the parked rows whose triggering event went with the
+stream.
 
 #### `A::Error: Into<replay::Error>` migration note
 
