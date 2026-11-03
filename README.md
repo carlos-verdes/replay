@@ -2318,6 +2318,37 @@ in flight, and for a catch-up or a build of any inline projection, whichever pro
 registered it; those waits, and your closure's, are bounded by the
 [stream lock wait](#stream-lock-wait).
 
+To discover every stream under a scope, including types with no read model, use
+`PostgresEventStore::stream_ids(StreamScope::within(&catalog_id), after)`. It returns
+a stream of `Urn`s across **all** stream types, including streams already compacted.
+For `urn:catalog:acme`, `within` is equivalent to
+`StreamScope::Suffix("@catalog:acme".into())`; both include nested ids.
+`%`, `_` and `\` are matched literally. `Prefix` and `All` are available too.
+
+The listing reads in bounded chunks and releases its connection before yielding, so
+you can delete batches while reading, even with a one-connection pool. For a page:
+
+```rust,ignore
+use futures::{StreamExt, TryStreamExt};
+use replay_persistence::StreamScope;
+
+let page: Vec<urn::Urn> = store
+    .stream_ids(StreamScope::within(&catalog_id), after)
+    .take(100)
+    .try_collect()
+    .await?;
+let next_after = page.last().cloned();
+// Pass `page` to delete_streams with your read-model cleanup closure.
+// Resume with `next_after`, even after deleting the page's ids.
+```
+
+Ids follow the `streams.id` collation, not `Urn`'s `Ord`; `after` is exclusive, with
+`None` starting at the beginning. An empty page ends the pass. This is **not** an atomic
+scope deletion or a snapshot: concurrent inserts behind the cursor, including recreated
+ids, may be missed, and a listed stream may disappear before deletion. Coordinate writers
+for a complete scope hard-delete, then list again from `None` to confirm the scope is
+empty. Include any additional exact ids separately when calling `delete_streams`.
+
 **Upgrade every process before the first deletion.** What keeps a running Policy, a
 catch-up and a build from writing for a deleted stream is in this release, on their side:
 a Policy runner of an earlier release can still write a place or park a dead letter for a
