@@ -132,6 +132,11 @@ impl<ES: EventStore> Cqrs<ES> {
     /// [`Next::Error`] as the error it carries. Metadata a middleware adds is carried by
     /// the appended events; a middleware can change nothing else about the command.
     ///
+    /// Each middleware's `before_commit` then runs at the append's commit gate, in
+    /// registration order, after the events and every inline projection write are in
+    /// place: the first that does not continue rolls the whole append back and reaches the
+    /// caller the same way.
+    ///
     /// Once the command has finished, each middleware whose `before` answered `Continue`
     /// runs its `after`, in reverse registration order, with the [`Outcome`]: committed,
     /// busy with the reason, or failed with the error this call returns. A middleware that
@@ -151,15 +156,16 @@ impl<ES: EventStore> Cqrs<ES> {
     {
         if self.middlewares.is_empty() {
             return self
-                .run::<A>(id, metadata, command, services, expected_version)
+                .run::<A>(id, metadata, command, services, expected_version, None)
                 .await;
         }
 
         let mut context = CommandContext::new::<A>(id, metadata);
         // How many middlewares answered `Continue`: the ones whose `after` runs.
         let mut continued = 0;
-        // The reason a middleware gave when it answered `Busy`.
+        // The reason a middleware gave when it answered `Busy`, in `before` or at the gate.
         let mut busy = None;
+        let gate_busy = std::sync::OnceLock::new();
 
         let result = 'command: {
             for middleware in self.middlewares.iter() {
@@ -182,14 +188,19 @@ impl<ES: EventStore> Cqrs<ES> {
                     Next::Error(error) => break 'command Err(A::Error::from(error)),
                 }
             }
-            self.run::<A>(
-                id,
-                context.metadata().clone(),
-                command,
-                services,
-                expected_version,
-            )
-            .await
+            let result = self
+                .run::<A>(
+                    id,
+                    context.metadata().clone(),
+                    command,
+                    services,
+                    expected_version,
+                    Some((&context, &gate_busy)),
+                )
+                .await;
+            // A `Busy` at the commit gate is as busy as one in `before`.
+            busy = busy.or_else(|| gate_busy.into_inner());
+            result
         };
 
         let outcome = match (&result, &busy) {
@@ -204,8 +215,12 @@ impl<ES: EventStore> Cqrs<ES> {
         result
     }
 
-    /// Load the aggregate, handle `command` and append what it produces, with no
-    /// middleware: what [`execute`](Self::execute) runs once every `before` continued.
+    /// Load the aggregate, handle `command` and append what it produces: what
+    /// [`execute`](Self::execute) runs once every `before` continued.
+    ///
+    /// With `gate`, the append's commit gate runs every middleware's `before_commit` on the
+    /// context `before` left, and records the reason of a `Busy` answer; without it, the
+    /// gate always continues.
     async fn run<A: Aggregate>(
         &self,
         id: &A::StreamId,
@@ -213,6 +228,7 @@ impl<ES: EventStore> Cqrs<ES> {
         command: A::Command,
         services: &A::Services,
         expected_version: Option<i64>,
+        gate: Option<(&CommandContext, &std::sync::OnceLock<String>)>,
     ) -> Result<A, A::Error>
     where
         A::Event: 'static,
@@ -237,14 +253,35 @@ impl<ES: EventStore> Cqrs<ES> {
             .await?
             .map_err(|e| replay::Error::internal("aggregate event producer failed").with_source(e));
 
+        // The commit gate: every middleware's `before_commit`, in registration order; the
+        // first that does not continue has the last word.
+        let middlewares = &self.middlewares;
+        let gate = || async move {
+            let Some((context, busy)) = gate else {
+                return Next::Continue;
+            };
+            for middleware in middlewares.iter() {
+                match middleware.before_commit(context).await {
+                    Next::Continue => {}
+                    Next::Busy(reason) => {
+                        let _ = busy.set(reason.clone());
+                        return Next::Busy(reason);
+                    }
+                    stop => return stop,
+                }
+            }
+            Next::Continue
+        };
+
         self.store
-            .store_events_stream::<A, _, _>(
+            .store_events_stream::<A, _, _, _>(
                 id,
                 stream_type,
                 metadata,
                 event_stream,
                 expected_version,
                 |event: &PersistedEvent<A::Event>| aggregate.apply(event.data.clone()),
+                gate,
             )
             .await
             .map_err(A::Error::from)?;
