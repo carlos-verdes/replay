@@ -1,6 +1,6 @@
 # Context digest: replay
 
-<!-- built from d9372e8 fingerprint db2b7830e1582c2d on 2026-11-05; refresh: see .github/skills/context-digest -->
+<!-- built from d9372e8 fingerprint 83e9358e8a5517e1 on 2026-11-05; refresh: run the context-digest skill -->
 
 A map, not a summary: one line per term, decision, section and tunable, each pointing at
 the authoritative text. Read this, then only the sections your ticket touches.
@@ -182,8 +182,8 @@ Numbers 0018 and 0021 are each used twice; cite by file name.
 - WASM: `make wasm-test` (`wasm-pack test --headless --chrome macros-tests`) when `es` or `macros` change; CI builds `es-replay` for `wasm32-unknown-unknown`.
 - Allocation budgets: `persistence/tests/*_allocations.rs` pin paths in bytes; a release never ships with them failing.
 - Release: [`docs/agents/release.md`](release.md): version policy, the four `Cargo.toml`s, publish order `es-replay`, `es-replay-macros`, `es-replay-persistence`; notes in `docs/releases/<version>.md`.
-- Issues: [`docs/agents/issue-tracker.md`](issue-tracker.md). Labels: [`docs/agents/triage-labels.md`](triage-labels.md). Domain docs: [`docs/agents/domain.md`](domain.md). Copilot: [`docs/agents/copilot-review.md`](copilot-review.md).
-- Digest check: `python3 .github/skills/context-digest/scripts/digest_check.py check . docs/agents/context-digest.md` (pre-commit hook and CI).
+- Issues: [`docs/agents/issue-tracker.md`](issue-tracker.md). Labels: [`docs/agents/triage-labels.md`](triage-labels.md). Domain docs: [`docs/agents/domain.md`](domain.md). Review checklists: [`docs/agents/review-standards.md`](review-standards.md). Copilot: [`docs/agents/copilot-review.md`](copilot-review.md).
+- Digest check: `python3 scripts/digest_check.py check . docs/agents/context-digest.md` (pre-commit hook and CI). Skills: installed from `skills-lock.json` (`make install-skills`), never vendored.
 
 ## Traps
 
