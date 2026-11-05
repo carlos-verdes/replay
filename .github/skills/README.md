@@ -10,6 +10,7 @@ reads `.github/skills/` — without anyone needing a machine-local install.
 | --------------------------- | --------------------------------------------- |
 | `address-pr-review`         | written for this repo                         |
 | `code-review`               | [mattpocock/skills](https://github.com/mattpocock/skills) |
+| `context-digest`            | written for this repo                         |
 | `diagnosing-bugs`           | [mattpocock/skills](https://github.com/mattpocock/skills) |
 | `domain-modeling`           | [mattpocock/skills](https://github.com/mattpocock/skills) |
 | `implement`                 | [mattpocock/skills](https://github.com/mattpocock/skills) |
@@ -29,6 +30,7 @@ These skills read their per-repo configuration from `docs/agents/`:
 - `docs/agents/issue-tracker.md` — issues live on `funkode-io/replay`
 - `docs/agents/triage-labels.md` — the triage label vocabulary
 - `docs/agents/domain.md` — `CONTEXT.md` and `docs/adr/` layout
+- `docs/agents/context-digest.md` — the map a worker reads before the sources; `context-digest` keeps it fresh
 - `docs/agents/release.md` — version policy, publish order and the pre-flight gate
 
 ## Updating
