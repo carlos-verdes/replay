@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Inventory the sources of a context digest and check a digest against them.
 
-    digest_check.py inventory <repo>
-    digest_check.py check <repo> <digest> [--budget TOKENS]
+    digest_check.py inventory <repo> [--env-prefix PREFIX]
+    digest_check.py check <repo> <digest> [--budget TOKENS] [--env-prefix PREFIX]
+
+The env-var prefix (e.g. REPLAY_) names the tunables the digest must list. Without
+--env-prefix it is read from docs/agents/domain.md, from a line such as
+"Env var prefix: `REPLAY_`"; with neither, tunables are not inventoried.
 
 Stdlib only. Token counts use tiktoken (o200k_base) when importable, else chars/3.8.
 """
@@ -15,10 +19,22 @@ SOURCES = ["AGENTS.md", "CONTEXT.md", "README.md"]
 ADR_DIR = "docs/adr"
 AGENTS_DIR = "docs/agents"
 DIGEST_NAME = "context-digest.md"
-ENV_RE = re.compile(r"\bREPLAY_[A-Z_]+\b")
+PREFIX_RE = re.compile(r"[Ee]nv(?:ironment)? var(?:iable)? prefix:\s*`?([A-Z][A-Z0-9]*_)`?")
 H2_RE = re.compile(r"^## (.+?)\s*$", re.M)
 TERM_RE = re.compile(r"^### (.+?)\s*$", re.M)
 LINK_RE = re.compile(r"\]\(([^)#\s]+)(#[^)\s]*)?\)")
+
+
+def env_re(repo, prefix=None):
+    """Regex for the repo's tunables, or None when no prefix is configured."""
+    if prefix is None:
+        domain = os.path.join(repo, AGENTS_DIR, "domain.md")
+        if os.path.isfile(domain):
+            m = PREFIX_RE.search(read(domain))
+            prefix = m.group(1) if m else None
+    if not prefix:
+        return None
+    return re.compile(r"\b" + re.escape(prefix) + r"[A-Z0-9_]+\b")
 
 
 def read(path):
@@ -54,14 +70,15 @@ def fingerprint(repo):
     return h.hexdigest()[:16]
 
 
-def inventory(repo):
+def inventory(repo, prefix=None):
     inv = {"fingerprint": fingerprint(repo), "rules": [], "terms": [], "adrs": [], "readme": [], "env": set(), "agents": []}
     inv["rules"] = H2_RE.findall(read(os.path.join(repo, "AGENTS.md")))
     ctx = read(os.path.join(repo, "CONTEXT.md"))
     inv["terms"] = TERM_RE.findall(ctx)
     readme = read(os.path.join(repo, "README.md"))
     inv["readme"] = H2_RE.findall(readme)
-    inv["env"] = sorted(set(ENV_RE.findall(readme)) | set(ENV_RE.findall(ctx)))
+    env = env_re(repo, prefix)
+    inv["env"] = sorted(set(env.findall(readme)) | set(env.findall(ctx))) if env else []
     adr = os.path.join(repo, ADR_DIR)
     for f in sorted(os.listdir(adr)):
         if f.endswith(".md"):
@@ -84,8 +101,8 @@ def norm(s):
     return re.sub(r"[`*]", "", s).strip().lower()
 
 
-def check(repo, digest_path, budget):
-    inv = inventory(repo)
+def check(repo, digest_path, budget, prefix=None):
+    inv = inventory(repo, prefix)
     digest = read(digest_path)
     low = norm(digest)
     failures = []
@@ -153,14 +170,15 @@ def heading_slug(h):
 
 
 def main(argv):
+    prefix = argv[argv.index("--env-prefix") + 1] if "--env-prefix" in argv else None
     if len(argv) >= 3 and argv[1] == "inventory":
-        print_inventory(inventory(os.path.abspath(argv[2])))
+        print_inventory(inventory(os.path.abspath(argv[2]), prefix))
         return 0
     if len(argv) >= 4 and argv[1] == "check":
         budget = 8000
         if "--budget" in argv:
             budget = int(argv[argv.index("--budget") + 1])
-        return check(os.path.abspath(argv[2]), os.path.abspath(argv[3]), budget)
+        return check(os.path.abspath(argv[2]), os.path.abspath(argv[3]), budget, prefix)
     print(__doc__)
     return 2
 

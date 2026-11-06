@@ -1,6 +1,6 @@
 # Context digest: replay
 
-<!-- built from d9372e8 fingerprint 83e9358e8a5517e1 on 2026-11-05; refresh: run the context-digest skill -->
+<!-- built from d9372e8 fingerprint c6c4f1e46443f5f9 on 2026-11-05; refresh: run the context-digest skill -->
 
 A map, not a summary: one line per term, decision, section and tunable, each pointing at
 the authoritative text. Read this, then only the sections your ticket touches.

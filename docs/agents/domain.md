@@ -17,6 +17,7 @@ ubiquitous language.
 
 The digest is checked against its sources by `scripts/digest_check.py`: a stale one fails
 the pre-commit hook. Refresh it with the `context-digest` skill (`funkode-io/skills`).
+Env var prefix: `REPLAY_` (the tunables the digest must list).
 
 If any of these files don't exist, **proceed silently**. Don't flag their absence; don't suggest creating them upfront. The `/domain-modeling` skill (reached via `/grill-with-docs` and `/improve-codebase-architecture`) creates them lazily when terms or decisions actually get resolved.
 
