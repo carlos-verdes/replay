@@ -120,10 +120,17 @@ pub trait CommandMiddleware: Send + Sync {
     /// Runs once the command has finished, whatever its outcome. It cannot change it: it
     /// is the hook for auditing and metrics.
     ///
+    /// It runs only when [`Cqrs::execute`](crate::Cqrs::execute) runs to its end. If the
+    /// call is dropped before then (a caller's timeout, or the Policy runner's dispatch
+    /// timeout), or the command panics, no `after` runs. Something `before` took that must be
+    /// given back is given back from a guard's `Drop`, not only from here.
+    ///
     /// It runs in reverse registration order, and only for the middlewares whose
     /// [`before`](CommandMiddleware::before) answered [`Next::Continue`], so the hooks
-    /// nest as web middleware does: a middleware that stopped the command, and every one
-    /// registered after it, runs no `after`. The context carries the metadata the
+    /// nest as web middleware does: a middleware that stopped the command in `before`, and
+    /// every one registered after it, runs no `after`. A refusal at the commit gate comes
+    /// after every `before` continued, so every middleware runs its `after`, the one that
+    /// refused included. The context carries the metadata the
     /// appended events carry, with what every `before` added.
     fn after<'a>(
         &'a self,
