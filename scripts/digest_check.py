@@ -25,6 +25,10 @@ TERM_RE = re.compile(r"^### (.+?)\s*$", re.M)
 LINK_RE = re.compile(r"\]\(([^)#\s]*)(#[^)\s]*)?\)")
 # A digest entry: a list item or table row whose first cell is the linked or bold name.
 ENTRY_RE = re.compile(r"^(?:- |\| )(?:\[([^\]]+)\]\(|\*\*([^*]+)\*\*)", re.M)
+# The link a list item opens with: what makes the item an entry for that target.
+ITEM_LINK_RE = re.compile(r"^- \[[^\]]*\]\(([^)#\s]*)(#[^)\s]*)?\)", re.M)
+# A table row whose first cell is exactly one code span: a tunable's own row.
+ROW_RE = re.compile(r"^\|\s*`([^`]+)`\s*\|", re.M)
 
 
 def env_re(repo, prefix=None):
@@ -106,8 +110,17 @@ def norm(s):
 def check(repo, digest_path, budget, prefix=None):
     inv = inventory(repo, prefix)
     digest = read(digest_path)
-    low = norm(digest)
+    base = os.path.dirname(digest_path)
     failures = []
+
+    def in_repo(path):
+        return os.path.relpath(os.path.normpath(os.path.join(base, path)), repo)
+
+    # A mention elsewhere in the digest is not an entry: a name counts only as the entry
+    # that points at it, so removing that entry fails even when the word appears elsewhere.
+    items = {(in_repo(path), anchor[1:]) for path, anchor in ITEM_LINK_RE.findall(digest) if path}
+    linked = {in_repo(path) for path, _ in LINK_RE.findall(digest) if path and not path.startswith("http")}
+    rows = set(ROW_RE.findall(digest))
 
     m = re.search(r"fingerprint ([0-9a-f]{16})", digest)
     if not m:
@@ -116,26 +129,25 @@ def check(repo, digest_path, budget, prefix=None):
         failures.append(f"stale: digest fingerprint {m.group(1)} != sources {inv['fingerprint']}")
 
     for rule in inv["rules"]:
-        if norm(rule) not in low:
-            failures.append(f"rule missing: {rule}")
+        if ("AGENTS.md", heading_slug(rule)) not in items:
+            failures.append(f"rule has no entry of its own: {rule}")
     entries = {norm(a or b) for a, b in ENTRY_RE.findall(digest)}
     for term in inv["terms"]:
         if norm(term) not in entries:
             failures.append(f"glossary term has no entry of its own: {term}")
     for adr in inv["adrs"]:
-        if adr.lower() not in low:
-            failures.append(f"ADR missing (cite the file name, numbers repeat): {adr}")
+        if (os.path.join(ADR_DIR, adr), "") not in items:
+            failures.append(f"ADR has no entry of its own (link the file name, numbers repeat): {adr}")
     for h in inv["readme"]:
-        if norm(h) not in low:
-            failures.append(f"README section missing: {h}")
+        if ("README.md", heading_slug(h)) not in items:
+            failures.append(f"README section has no entry of its own: {h}")
     for env in inv["env"]:
-        if env.lower() not in low:
-            failures.append(f"env var missing: {env}")
+        if env not in rows:
+            failures.append(f"env var has no table row of its own: {env}")
     for a in inv["agents"]:
-        if a.lower() not in low:
-            failures.append(f"docs/agents file missing: {a}")
+        if os.path.join(AGENTS_DIR, a) not in linked:
+            failures.append(f"docs/agents file not linked: {a}")
 
-    base = os.path.dirname(digest_path)
     own_slugs = {heading_slug(h) for h in re.findall(r"^#{1,6} (.+?)\s*$", digest, re.M)}
     for path, anchor in LINK_RE.findall(digest):
         if path.startswith("http"):
