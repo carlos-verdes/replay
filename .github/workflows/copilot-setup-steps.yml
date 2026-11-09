@@ -22,11 +22,6 @@ jobs:
           node-version: 22
 
       - name: install skills from skills-lock.json
-        run: |
-          # one `npx skills add` per source, with one `-s` per skill (the CLI takes no comma list)
-          jq -r '.skills | to_entries[] | "\(.value.source) \(.key)"' skills-lock.json \
-            | sort | awk '{ a[$1] = a[$1] " -s " $2 } END { for (s in a) print s a[s] }' \
-            | while read -r source flags; do
-                # shellcheck disable=SC2086
-                npx -y skills add "$source" $flags -a '*' -y
-              done
+        # Frozen restore: installs exactly the content the lock hashes, into .agents/skills/,
+        # the directory the skills CLI maps to GitHub Copilot. Fails if a source has changed.
+        run: npx -y skills experimental_install --frozen-lockfile

@@ -22,7 +22,9 @@ DIGEST_NAME = "context-digest.md"
 PREFIX_RE = re.compile(r"[Ee]nv(?:ironment)? var(?:iable)? prefix:\s*`?([A-Z][A-Z0-9]*_)`?")
 H2_RE = re.compile(r"^## (.+?)\s*$", re.M)
 TERM_RE = re.compile(r"^### (.+?)\s*$", re.M)
-LINK_RE = re.compile(r"\]\(([^)#\s]+)(#[^)\s]*)?\)")
+LINK_RE = re.compile(r"\]\(([^)#\s]*)(#[^)\s]*)?\)")
+# A digest entry: a list item or table row whose first cell is the linked or bold name.
+ENTRY_RE = re.compile(r"^(?:- |\| )(?:\[([^\]]+)\]\(|\*\*([^*]+)\*\*)", re.M)
 
 
 def env_re(repo, prefix=None):
@@ -116,13 +118,13 @@ def check(repo, digest_path, budget, prefix=None):
     for rule in inv["rules"]:
         if norm(rule) not in low:
             failures.append(f"rule missing: {rule}")
+    entries = {norm(a or b) for a, b in ENTRY_RE.findall(digest)}
     for term in inv["terms"]:
-        if norm(term) not in low:
-            failures.append(f"glossary term missing: {term}")
+        if norm(term) not in entries:
+            failures.append(f"glossary term has no entry of its own: {term}")
     for adr in inv["adrs"]:
-        num = adr[:4]
-        if f"adr-{num}" not in low and adr.lower() not in low:
-            failures.append(f"ADR missing: {adr}")
+        if adr.lower() not in low:
+            failures.append(f"ADR missing (cite the file name, numbers repeat): {adr}")
     for h in inv["readme"]:
         if norm(h) not in low:
             failures.append(f"README section missing: {h}")
@@ -134,8 +136,13 @@ def check(repo, digest_path, budget, prefix=None):
             failures.append(f"docs/agents file missing: {a}")
 
     base = os.path.dirname(digest_path)
+    own_slugs = {heading_slug(h) for h in re.findall(r"^#{1,6} (.+?)\s*$", digest, re.M)}
     for path, anchor in LINK_RE.findall(digest):
         if path.startswith("http"):
+            continue
+        if not path:
+            if anchor[1:] not in own_slugs:
+                failures.append(f"broken anchor: {anchor}")
             continue
         target = os.path.normpath(os.path.join(base, path))
         if not os.path.exists(target):
