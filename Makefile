@@ -54,7 +54,7 @@ uninstall-hooks:
 
 .PHONY: install-skills
 install-skills:
-	npx -y skills experimental_install --frozen-lockfile
+	npx -y skills@1.7.6 experimental_install --frozen-lockfile
 
 .PHONY: wasm-test
 wasm-test:

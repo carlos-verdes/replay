@@ -24,4 +24,4 @@ jobs:
       - name: install skills from skills-lock.json
         # Frozen restore: installs exactly the content the lock hashes, into .agents/skills/,
         # the directory the skills CLI maps to GitHub Copilot. Fails if a source has changed.
-        run: npx -y skills experimental_install --frozen-lockfile
+        run: npx -y skills@1.7.6 experimental_install --frozen-lockfile
