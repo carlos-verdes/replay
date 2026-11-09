@@ -23,8 +23,6 @@ PREFIX_RE = re.compile(r"[Ee]nv(?:ironment)? var(?:iable)? prefix:\s*`?([A-Z][A-
 H2_RE = re.compile(r"^## (.+?)\s*$", re.M)
 TERM_RE = re.compile(r"^### (.+?)\s*$", re.M)
 LINK_RE = re.compile(r"\]\(([^)#\s]*)(#[^)\s]*)?\)")
-# A digest entry: a list item or table row whose first cell is the linked or bold name.
-ENTRY_RE = re.compile(r"^(?:- |\| )(?:\[([^\]]+)\]\(|\*\*([^*]+)\*\*)", re.M)
 # The link a list item opens with: what makes the item an entry for that target.
 ITEM_LINK_RE = re.compile(r"^- \[[^\]]*\]\(([^)#\s]*)(#[^)\s]*)?\)", re.M)
 # A table row whose first cell is exactly one code span: a tunable's own row.
@@ -103,10 +101,6 @@ def print_inventory(inv):
             print(f"  {item}")
 
 
-def norm(s):
-    return re.sub(r"[`*]", "", s).strip().lower()
-
-
 def check(repo, digest_path, budget, prefix=None):
     inv = inventory(repo, prefix)
     digest = read(digest_path)
@@ -131,9 +125,8 @@ def check(repo, digest_path, budget, prefix=None):
     for rule in inv["rules"]:
         if ("AGENTS.md", heading_slug(rule)) not in items:
             failures.append(f"rule has no entry of its own: {rule}")
-    entries = {norm(a or b) for a, b in ENTRY_RE.findall(digest)}
     for term in inv["terms"]:
-        if norm(term) not in entries:
+        if ("CONTEXT.md", heading_slug(term)) not in items:
             failures.append(f"glossary term has no entry of its own: {term}")
     for adr in inv["adrs"]:
         if (os.path.join(ADR_DIR, adr), "") not in items:
