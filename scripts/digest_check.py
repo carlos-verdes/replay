@@ -22,7 +22,7 @@ DIGEST_NAME = "context-digest.md"
 PREFIX_RE = re.compile(r"[Ee]nv(?:ironment)? var(?:iable)? prefix:\s*`?([A-Z][A-Z0-9]*_)`?")
 H2_RE = re.compile(r"^## (.+?)\s*$", re.M)
 TERM_RE = re.compile(r"^### (.+?)\s*$", re.M)
-LINK_RE = re.compile(r"\]\(([^)#\s]*)(#[^)\s]*)?\)")
+LINK_RE = re.compile(r"\]\(([^)#\s]*)(#[^)\s]*)?(?:\s+\"[^\"]*\")?\)")
 # The link a list item opens with: what makes the item an entry for that target.
 ITEM_LINK_RE = re.compile(r"^- \[[^\]]*\]\(([^)#\s]*)(#[^)\s]*)?\)", re.M)
 # A table row whose first cell is exactly one code span: a tunable's own row.
@@ -44,6 +44,21 @@ def env_re(repo, prefix=None):
 def read(path):
     with open(path, encoding="utf-8") as f:
         return f.read()
+
+
+def prose(text):
+    """The text without its fenced code blocks: a `# comment` in a fence is no heading."""
+    lines, fence = [], None
+    for line in text.splitlines():
+        m = re.match(r" {0,3}(`{3,}|~{3,})(.*)$", line)
+        if fence is None:
+            if m:
+                fence = m.group(1)
+            else:
+                lines.append(line)
+        elif m and m.group(1).startswith(fence) and not m.group(2).strip():
+            fence = None
+    return "\n".join(lines)
 
 
 def tokens(text):
@@ -76,11 +91,11 @@ def fingerprint(repo):
 
 def inventory(repo, prefix=None):
     inv = {"fingerprint": fingerprint(repo), "rules": [], "terms": [], "adrs": [], "readme": [], "env": set(), "agents": []}
-    inv["rules"] = H2_RE.findall(read(os.path.join(repo, "AGENTS.md")))
+    inv["rules"] = H2_RE.findall(prose(read(os.path.join(repo, "AGENTS.md"))))
     ctx = read(os.path.join(repo, "CONTEXT.md"))
-    inv["terms"] = TERM_RE.findall(ctx)
+    inv["terms"] = TERM_RE.findall(prose(ctx))
     readme = read(os.path.join(repo, "README.md"))
-    inv["readme"] = H2_RE.findall(readme)
+    inv["readme"] = H2_RE.findall(prose(readme))
     env = env_re(repo, prefix)
     inv["env"] = sorted(set(env.findall(readme)) | set(env.findall(ctx))) if env else []
     adr = os.path.join(repo, ADR_DIR)
@@ -141,7 +156,7 @@ def check(repo, digest_path, budget, prefix=None):
         if os.path.join(AGENTS_DIR, a) not in linked:
             failures.append(f"docs/agents file not linked: {a}")
 
-    own_slugs = {heading_slug(h) for h in re.findall(r"^#{1,6} (.+?)\s*$", digest, re.M)}
+    own_slugs = {heading_slug(h) for h in re.findall(r"^#{1,6} (.+?)\s*$", prose(digest), re.M)}
     for path, anchor in LINK_RE.findall(digest):
         if path.startswith("http"):
             continue
@@ -153,7 +168,7 @@ def check(repo, digest_path, budget, prefix=None):
         if not os.path.exists(target):
             failures.append(f"broken link: {path}")
         elif anchor and target.endswith(".md"):
-            text = read(target)
+            text = prose(read(target))
             slug = anchor[1:]
             slugs = {heading_slug(h) for h in re.findall(r"^#{1,6} (.+?)\s*$", text, re.M)}
             if slug not in slugs:
