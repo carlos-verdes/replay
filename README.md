@@ -264,12 +264,14 @@ Rules of thumb:
 - **Each way a thing comes about is its own event** (`CreatedByUser`, `ImportedFromFile`), so the handler can tell them apart.
 - **A correction is its own fact** (`MergeCorrected`), not the original event re-emitted with new values, and it carries what the actor did, not what the state was before: the previous value is already in the stream.
 - **An attested value is part of the fact.** `MonthlyClosed { closing_balance }` records the figure the month was closed with, which must not move if the rules change later. The test: if the rule that produced the value changed tomorrow, should the stored value change too? If yes, it is state — derive it in `apply`.
-- **An external fact is not an event.** A supplier's row, a file's contents, another
-  system's prices: the domain did not decide them, so they belong in a table it reads
-  when it decides, not in the log. The log records the decision — `RecordAccepted`,
-  `PriceTakenFromFile` — and a decision that is bulk by design goes through the bulk lane
-  ([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)) so
-  it never slows the Policies reacting to everything else.
+- **Raw external input is not an event; what the domain decides about it is.** A
+  supplier's rows, a file's contents or another system's prices were not decided by the
+  domain. They belong in a table it reads when it decides, because a log fed with
+  someone else's data grows with that input and every consumer has to read through it.
+  The log records the decision: `RenamedByFile { name }` above is the product taking the
+  name the file proposed, not the file row. A decision that is bulk by design, such as
+  an import's accepted records, goes through [the bulk lane](#the-bulk-lane) so it never
+  slows the Policies that react to everything else.
 - **Compaction follows the same rule.** `compacted_events` returns events that rebuild the state through `apply`, so the rules stay in one place; it never writes the state itself into a made-up event.
 
 ### Compaction
@@ -1770,8 +1772,8 @@ new projection keeps appending events the projection never sees, and an old pod 
 older *version* of it applies its old logic to the view the new version just rebuilt.
 
 So every append records which projections it applied, and the store **catches up** each
-projection on the events of every other transaction — once per projection version, in
-`global_position` order, whichever process appended them
+projection on the events of every other transaction — once per projection version,
+whichever process appended them, each stream's events in that stream's order
 ([ADR-0032](docs/adr/0032-an-inline-projection-catches-up-on-transactions-that-did-not-apply-it.md)):
 
 - **at startup**, in `build()`, for a projection whose stored version equals its code
@@ -1800,6 +1802,9 @@ each projection version exactly once. But:
 - **Late arrival.** A caught-up event can land after a later event of the same stream was
   applied live. A handler whose result depends on order should guard on a value its view
   keeps.
+- **No order across streams.** The events a catch-up applies reach `handle` in each
+  stream's own order, and in no promised order between streams. A handler that combines
+  events of several streams must not depend on which stream's events arrive first.
 - **Re-application across versions.** An event an older version applied live during a
   rollout is applied again by the newer version. Write the view with upserts that set
   values, so the newer logic wins. One that accumulates, like the running balance above,
@@ -1861,6 +1866,289 @@ to ~1 s. List every type the projection's `Event` can hold — a type left out n
 
 Inline projections are Postgres-only. The in-memory store remains useful for tests, but the
 transactional guarantee belongs to the Postgres backend.
+
+## Command middleware
+
+A command middleware is code you register once on `Cqrs` to run around every command
+it executes: refuse commands during maintenance, add the acting user or a tenant id to
+their metadata, audit or measure them
+([ADR-0035](docs/adr/0035-a-command-passes-through-middleware-before-it-runs-and-before-it-commits.md)).
+
+> The full, compilable source for both examples below lives in
+> [persistence/examples/command_middleware.rs](persistence/examples/command_middleware.rs)
+> and is exercised by the integration tests, so the README stays in lock-step with
+> working code. Run it (no database required) with
+> `cargo run -p es-replay-persistence --example command_middleware`.
+
+### The three hooks
+
+A middleware implements `CommandMiddleware`. Each hook defaults to doing nothing, so a
+middleware implements only the ones it needs:
+
+| Hook | Runs | Gets | Answers |
+|------|------|------|---------|
+| `before` | Before the aggregate is loaded | `CommandContextMut`: the context to read, the metadata to add to | `Next` |
+| `before_commit` | At the **commit gate**: inside the append transaction, after the events are inserted and every inline projection has run, immediately before the commit | `&CommandContext`, read-only | `Next` |
+| `after` | Once the command has finished, whatever its outcome | `&CommandContext` and the `Outcome` | nothing |
+
+The first two answer `Next`:
+
+```rust,ignore
+pub enum Next {
+    /// Go on: the next middleware runs, then the command.
+    Continue,
+    /// Not now; the same command may succeed later. Not a failure.
+    Busy(String),
+    /// The command is refused or the middleware failed.
+    Error(replay::Error),
+}
+```
+
+- **`before` stops or enriches.** `Busy` or `Error` stops the command before anything
+  is read: nothing is loaded, handled or appended. `insert_metadata` and `set_metadata`
+  add to the command's metadata; later middlewares see what was added, and the appended
+  events carry it. Nothing else about the command can change, and the `causation` key is
+  the Policy runner's: a middleware cannot alter it.
+- **`before_commit` rolls back.** Anything but `Continue` rolls the whole append back,
+  inline projection writes included. It gets no transaction handle — the middleware
+  decides, the store commits or rolls back — so the same middleware works on Postgres
+  and on the in-memory store.
+- **`after` only observes.** `Outcome` is `Committed`, `Busy(reason)` or
+  `Failed(error)`. Nothing `after` does changes what `execute` returns.
+
+The context carries the aggregate type, the stream type, the stream id, the command's
+type name, the metadata and, when a Policy dispatched the command, its `Causation`
+(`None` for an application's command). It does not carry the command itself: one
+middleware serves every aggregate, so a rule that must decide on a command's content
+decides on its metadata.
+
+### Ordering
+
+```rust,ignore
+let cqrs = Cqrs::new(store)
+    .with_middleware(maintenance.clone())
+    .with_middleware(ActingUser);
+```
+
+Middlewares run in registration order, as web-server middleware does. The first that
+does not answer `Continue`, in `before` or in `before_commit`, stops the chain; later
+ones do not run that hook. `after` runs in reverse order, and only for the middlewares
+whose `before` answered `Continue`, so the hooks nest:
+
+- a middleware that stops the command in **`before`**, and every one registered after
+  it, runs no `after`;
+- a refusal at the **commit gate** comes after every `before` has continued, so every
+  middleware runs its `after` — the one that refused and those registered after it
+  included — and sees the `Busy` or `Failed` outcome.
+
+`after` runs only when `execute` runs to its end. If its future is dropped before then (a
+caller's timeout, or the Policy runner's [dispatch timeout](#dispatch-timeout) abandoning a
+dispatch), or the command panics, no `after` runs. So a middleware that takes something in
+`before` that must be given back, such as a permit or a lock, gives it back from a guard's
+`Drop`, not only from `after`. Clones of a `Cqrs` share its chain,
+and a `Cqrs` without middleware behaves as if the feature did not exist.
+
+### What a caller sees
+
+`Cqrs::execute` still returns the aggregate's error type, through
+`A::Error: From<replay::Error>` like every store error:
+
+- `Next::Error(e)` reaches the caller as `e`, unchanged: a `Forbidden` refusal stays
+  `Forbidden`.
+- `Next::Busy(reason)` reaches the caller as a `replay::Error` of kind
+  `ErrorKind::Busy` carrying `reason` as its message. `Busy` is temporary — the same
+  command may succeed later — so an HTTP layer maps it to `503 Service Unavailable`.
+  Anyone may return `replay::Error::busy(reason)`; a command handler that cannot
+  proceed now may too.
+
+### What middleware covers, and what it does not
+
+Middleware runs on every command `Cqrs` executes: an application's call and a Policy's
+dispatch alike, because the runner executes through the `Cqrs` it was built with, and a
+bulk execution (`Cqrs::execute_bulk`). A bulk execution runs `before` once and asks
+`before_commit` before each segment commits, so a middleware that stops it mid-way rolls
+back the segment it is in, and the segments before it stay committed — maintenance mode
+switched on during a bulk import stops it at a segment boundary. Middleware runs on
+nothing that is not a command: a direct append through the store
+(`store_events`), compaction, stream deletion, an inline projection rebuild or a
+catch-up never reach it. It is not a projection: it writes no row to the projection
+registry and no applied mark, so it leaves no catch-up debt.
+
+### Example: maintenance mode
+
+Maintenance mode answers `Busy` in **both** hooks while a flag is on. `before` stops a
+command that arrives during maintenance before it reads anything; `before_commit`
+stops one that checked the flag just before it was switched on and has not committed
+yet.
+
+```rust
+/// Holds every command while maintenance mode is on.
+///
+/// It answers [`Next::Busy`] in `before`, so a command that arrives during maintenance
+/// costs no read and no append, and again in `before_commit`, so a command that checked
+/// the flag just before it was switched on still cannot commit. A caller sees
+/// `ErrorKind::Busy`; a Policy holds the command and runs it once maintenance is over.
+///
+/// The flag here is this process's own. A fleet of processes reads it from where every
+/// one of them sees it, as it is on each check — a row read on every call, never a cached
+/// copy — or `await_in_flight_commits` cannot vouch for the other processes' appends.
+#[derive(Clone, Default)]
+pub struct MaintenanceMode {
+    switched_on: Arc<AtomicBool>,
+}
+
+impl MaintenanceMode {
+    /// Switch maintenance mode on, and return once no command that checked the flag
+    /// while it was off can still commit: from then on the store is quiet.
+    pub async fn switch_on(&self, store: &PostgresEventStore) -> replay::Result<()> {
+        self.switched_on.store(true, Ordering::SeqCst);
+        store.await_in_flight_commits().await
+    }
+
+    /// Switch maintenance mode off. Held Policies resume on their own.
+    pub fn switch_off(&self) {
+        self.switched_on.store(false, Ordering::SeqCst);
+    }
+
+    fn check(&self) -> Next {
+        if self.switched_on.load(Ordering::SeqCst) {
+            Next::Busy("maintenance in progress".to_string())
+        } else {
+            Next::Continue
+        }
+    }
+}
+
+impl CommandMiddleware for MaintenanceMode {
+    fn before<'a>(&'a self, _context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
+        Box::pin(async move { self.check() })
+    }
+
+    fn before_commit<'a>(&'a self, _context: &'a CommandContext) -> BoxFuture<'a, Next> {
+        Box::pin(async move { self.check() })
+    }
+}
+```
+
+The switch is the other half: set the flag, then call
+`PostgresEventStore::await_in_flight_commits()`. When a `Cqrs` has middleware, each
+of its appends takes a shared lock just before its commit gate and holds it until it
+commits or rolls back; `await_in_flight_commits` takes the same lock exclusively. So
+when it returns, every append that checked the flag while it was off has committed or
+rolled back, and every later append checks it on — the store is quiet. That holds for
+the appends of every process on the same database, provided each reads the flag as it
+is: a flag in a database row read on every check, not a cached copy.
+
+`await_in_flight_commits` waits for as long as the slowest append in flight takes, and
+while it waits new gated appends queue behind it, each for at most the
+[stream lock wait](#stream-lock-wait) before failing as `Unavailable`. It is meant for
+an operator's switch, not for a request path. Appends that ask no gate — a direct
+append, or a `Cqrs` with no middleware — take no lock and are never waited for.
+
+### Example: the acting user
+
+An enricher adds what every event should record — here the user a command acts for —
+without each command handler stamping it. The user comes from the request, through a
+task-local the application's request layer sets around the commands it executes; a
+Policy's command acts for the Policy, named from its causation. `after` audits how the
+command ended.
+
+```rust
+tokio::task_local! {
+    /// The user the current request acts for, set by the application's request layer
+    /// around the commands it executes.
+    pub static ACTING_USER: String;
+}
+
+/// The metadata key [`ActingUser`] writes.
+pub const ACTING_USER_KEY: &str = "acting_user";
+
+/// Adds the user a command acts for to its metadata, so the events it appends record
+/// who did it, and audits how each command ended.
+///
+/// An application's command acts for the request's [`ACTING_USER`]; a command without
+/// one is refused as `Unauthorized`. A Policy's command acts for the Policy, named from
+/// the command's causation.
+pub struct ActingUser;
+
+impl CommandMiddleware for ActingUser {
+    fn before<'a>(&'a self, mut context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
+        Box::pin(async move {
+            let acting_user = match context.causation() {
+                Some(causation) => format!("policy:{}", causation.policy()),
+                None => match ACTING_USER.try_with(Clone::clone) {
+                    Ok(user) => user,
+                    Err(_) => {
+                        return Next::Error(replay::Error::unauthorized(
+                            "a command needs an acting user",
+                        ))
+                    }
+                },
+            };
+            match context.insert_metadata(ACTING_USER_KEY, acting_user) {
+                Ok(()) => Next::Continue,
+                Err(error) => Next::Error(error),
+            }
+        })
+    }
+
+    fn after<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        outcome: &'a Outcome<'a>,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let acting_user = context.metadata().as_json().get(ACTING_USER_KEY);
+            tracing::info!(
+                command = context.command_type(),
+                stream_id = %context.stream_id(),
+                acting_user = ?acting_user,
+                outcome = ?outcome,
+                "command finished"
+            );
+        })
+    }
+}
+```
+
+```rust,ignore
+ACTING_USER
+    .scope(
+        "alice".to_string(),
+        cqrs.execute::<BankAccount>(&account, Default::default(), deposit(100.0), &(), None),
+    )
+    .await?;
+```
+
+A `tokio::task_local!` is visible to the futures polled inside its `scope`, which is
+where `execute` runs the middleware; it is not inherited by a task spawned from there.
+
+### A busy command in a Policy
+
+A Policy's command passes through the same middleware, so maintenance mode covers
+background work with no second configuration. When a dispatch answers `Busy`, the
+runner **holds** the Policy on that event instead of parking a dead letter
+([ADR-0036](docs/adr/0036-a-busy-command-is-held-not-dead-lettered.md)):
+
+- it tries the reaction again after a backoff that starts at 100 ms and doubles up to
+  5 s, for as long as it stays busy;
+- busy attempts spend nothing of the dispatch retry budget and never write a dead
+  letter; the first attempt that answers anything else is settled by the usual
+  [failure handling](#failure-handling), with a fresh budget;
+- the hold is narrated once on entering and once on leaving, never per attempt
+  ([What a policy logs](#what-a-policy-logs)), and the worker keeps beating its
+  heartbeat: it is alive and waiting, not hung;
+- each attempt is still bounded by the [dispatch timeout](#dispatch-timeout), and a
+  shutdown or a lost leadership calls the hold off: nothing is parked or advanced, and
+  whoever leads next delivers the event again;
+- a `retry_dead_letter` whose replay meets `Busy` leaves the rows parked as they were
+  and reports `DeadLetterRetry::Busy`;
+- a Policy on the bulk lane does not hold inside a batch: a busy command ends the batch,
+  its claim rolls back with nothing parked, and the work is claimed again on the next
+  poll.
+
+Switching maintenance off needs nothing more: a held Policy runs its command on its
+next attempt and catches up.
 
 ## Querying Events from Multiple Aggregates
 
@@ -2624,13 +2912,14 @@ the runner knows which transactions it could not see. Once those transactions en
 indexed lookup of their `commit_txid`s nominates their streams on the next poll. A transaction
 whose id was assigned after the sweep snapshot is found by the carried transaction-id range.
 Both lookups are bounded by `read_batch_size` and lead the poll; the full comparison remains
-as a safety net. It costs a scan of one row per tracked stream — every stream, unless the
-policy is [filtered by stream type](#a-policy-filtered-by-stream-type-tracks-only-those-types)
-— so it runs on a cadence rather than per poll:
+as a safety net. Each cadence compares one bounded window of tracked streams, narrowed when
+the policy is [filtered by stream type](#a-policy-filtered-by-stream-type-tracks-only-those-types)
+with these bounds:
 
 | Setting | Default | What it bounds |
 |---------|---------|----------------|
 | `REPLAY_POLICY_RECONCILE_SECS` | 300 | Safety-net comparison cadence in seconds. Never *whether*. |
+| `PolicyRunnerBuilder::reconcile_window(NonZeroU32)` | 10,000 | Stream rows per statement (per tracked type before merging a typed window). |
 
 Lower it for faster recovery from a defect; normal late-write delivery does not wait for it.
 `PolicyRunnerBuilder::reconcile_every(Duration)` sets it per runner instead;
@@ -2648,14 +2937,14 @@ must not wait a cadence
 ([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). A manual
 `PolicyRunner::drain` always compares on the spot.
 
-The reconciliation reads up to `read_batch_size` streams per cadence, **resumes where it
-left off** and wraps. The pass takes `ceil(streams behind / read_batch_size)` cadences
-while the policy is keeping up, plus the one a pass spends wrapping — a rotation standing
-past the last stream id reads an empty page and compares nothing that cadence, which is
-why even a policy behind on a single stream can take two. Longer when it is not keeping
-up: the reconciliation leads the poll it runs on, so it always reads at least one stream,
-and its rotation never steps over a stream it did not read. [ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)
-owns the bound.
+Cadence comparisons advance through at most one scan window, stopping before any behind
+stream the poll did not read. The safety-net bound is
+`ceil(tracked streams / window) + streams behind + 1` cadences
+([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
+Startup and manual comparisons wrap once from the saved rotation until they find a
+candidate batch or complete a pass. When nothing is behind, that costs roughly
+`ceil(tracked streams / window)` statements plus boundary probes in one poll; delivery
+waits for the comparison to finish.
 
 `read_batch_size` is one budget for a whole poll, spent across the streams that poll looks
 at — not a batch per stream. A policy owed work in a hundred streams reads the same number
@@ -2776,7 +3065,7 @@ because a place is only read for a stream that poll is looking at:
 | The stream you moved | When it is picked up |
 |---|---|
 | is still being written to | the next poll, on the sweep |
-| is quiet and the sweep has passed it | the next full comparison that reaches it — `ceil(streams behind / read_batch_size) + 1` cadences of `REPLAY_POLICY_RECONCILE_SECS`, the `+ 1` being the cadence a pass spends wrapping past the last stream id ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). A moved place has no writing transaction for the late-write lookup to find, so this is the one case that waits for the safety net; `PolicyRunner::drain` picks it up at once. |
+| is quiet and the sweep has passed it | the next comparison that reaches it — at most `ceil(tracked streams / window) + streams behind + 1` cadences of `REPLAY_POLICY_RECONCILE_SECS`, the `+ 1` being the cadence a pass spends wrapping past the last stream id ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). A moved place has no writing transaction for the late-write lookup to find, so this is the one case that waits for the safety net; `PolicyRunner::drain` compares immediately, up to one candidate batch. |
 
 Places themselves are never held in memory between polls, so no running process carries a
 stale copy of one forward.
@@ -2790,6 +3079,154 @@ next one. Moving forward skips the events in between (they are never delivered);
 backward re-delivers them, which is safe under the same idempotency contract that
 covers crash re-delivery. See
 [ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md).
+
+### The bulk lane
+
+Some decisions are bulk by design. A file import accepts thousands of records, and each
+acceptance is a decision that the same Policies react to as they would to a record
+accepted from the UI. On the online lane every Policy sweeps, nominates, reads and places
+each of those events, including the Policies that do not want them. The **bulk lane**
+takes that path out of their way. A bulk append writes its events to the event store
+and, in the same transaction, one row of work per event for each Policy that consumes
+the bulk lane. That Policy's worker claims the work in batches, calls the same `react`,
+dispatches and deletes it. Online Policies never receive a bulk event
+([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+
+Online stays the default. `execute`, `handle` and every Policy registered without a lane
+behave exactly as before, so adopting the bulk lane is a change per command and per
+Policy, made at the consumer's pace.
+
+**Before:** one online command. The handler collects every event into a `Vec`, `execute`
+appends them in one transaction, and every Policy reads them through its feed.
+
+```rust,ignore
+impl Aggregate for Import {
+    type Command = ImportCommand;
+    type Error = ImportError;
+    type Services = ImportFiles;
+
+    async fn handle(&self, cmd: ImportCommand, svc: &ImportFiles)
+        -> Result<Vec<ImportEvent>, ImportError>
+    {
+        match cmd {
+            ImportCommand::ProcessFile { file } => {
+                let rows = svc.parse(&file).await?;        // all 12k rows in memory
+                Ok(rows.into_iter().map(|row| ImportEvent::RecordAccepted { row }).collect())
+            }
+            // …
+        }
+    }
+}
+
+cqrs.execute::<Import>(&import_id, metadata, ImportCommand::ProcessFile { file }, &services, None)
+    .await?;
+
+PolicyRunner::builder(cqrs)
+    .register_services::<Sku>(sku_services)            // the aggregates the Policies dispatch to
+    .register_services::<Brand>(())
+    .register_services::<FeeLedger>(fee_services)
+    .register_policy(CreateSku, PolicySettings::new()
+        .with_stream_filter(StreamFilter::for_stream_type::<Import>()))
+    .register_policy(EnsureBrand, PolicySettings::new()
+        .with_stream_filter(StreamFilter::for_stream_type::<Import>()))
+    .register_policy(DepositFee, PolicySettings::new())  // unrelated, still sweeps the 12k
+    .build();
+```
+
+**After:** the handler streams instead of collecting, `execute` becomes `execute_bulk`
+followed by an ordinary completion command, and the Policies gain only a lane at
+registration. Their `react` does not change.
+
+```rust,ignore
+impl Aggregate for Import {
+    // …
+    async fn handle_stream(&self, cmd: ImportCommand, svc: &ImportFiles)
+        -> Result<BoxStream<'static, Result<ImportEvent, ImportError>>, ImportError>
+    {
+        match cmd {
+            ImportCommand::ProcessFile { file } => Ok(svc
+                .rows(&file)                                     // a stream, never a Vec
+                .map_ok(|row| ImportEvent::RecordAccepted { row })
+                .boxed()),
+            // `handle` still serves the online commands, such as `Complete`.
+            other => Ok(futures::stream::iter(self.handle(other, svc).await?)
+                .map(Ok)
+                .boxed()),
+        }
+    }
+}
+
+// Register the bulk Policies before the first bulk: work is queued at the append, only
+// for the Policies registered by then. `drain` registers them and returns; building the
+// runner alone does not, and `start_polling` registers them in the background.
+let runner = PolicyRunner::builder(cqrs.clone())
+    .register_services::<Sku>(sku_services)            // the aggregates the Policies dispatch to
+    .register_services::<Brand>(())
+    .register_services::<FeeLedger>(fee_services)
+    .register_policy(CreateSku, PolicySettings::new()
+        .with_stream_filter(StreamFilter::for_stream_type::<Import>())
+        .on_lanes(Lanes::Bulk))       // file records only, through the work queue
+    .register_policy(EnsureBrand, PolicySettings::new()
+        .with_stream_filter(StreamFilter::for_stream_type::<Import>())
+        .on_lanes(Lanes::Both))       // UI records online, file records bulk
+    .register_policy(DepositFee, PolicySettings::new())  // online by default; never sees a bulk event
+    .build();
+runner.drain().await?;
+let daemon = runner.start_polling(Duration::from_secs(30));
+
+// Commits in segments of `bulk_segment_size` events, each one transaction with its
+// inline-projection rows and its bulk work. Returns once every segment has committed.
+cqrs.execute_bulk::<Import>(&import_id, metadata.clone(), ImportCommand::ProcessFile { file }, &services, None)
+    .await?;
+
+// The domain records completion the ordinary way, if anyone needs to know.
+cqrs.execute::<Import>(&import_id, metadata, ImportCommand::Complete, &services, None)
+    .await?;
+```
+
+What each party sees:
+
+| | Online Policies | Bulk Policies | Inline projections |
+|---|---|---|---|
+| While `execute_bulk` runs | nothing: the sweep's partial indexes skip bulk rows, and a stream read passes them as filtered rows | batches, claimed as each segment commits | the rows of each segment, in its transaction |
+| After `execute_bulk` returns | the `Complete` event only | they drain the queue to empty, then idle | up to date |
+| A worker crashes mid-batch | unaffected | the batch's rows are claimed again: at-least-once | unaffected |
+| `execute_bulk` fails mid-way | unaffected | the committed segments' work is delivered | the committed segments' rows stand |
+
+The rules:
+
+- **Per-stream order only.** A bulk Policy receives a stream's events in that stream's
+  order, because one worker per Policy claims in `global_position` order. Nothing orders
+  one stream against another, and nothing orders a Policy's bulk events against its
+  online ones: a Policy on `Lanes::Both` must not rely on either.
+- **Reactions are idempotent.** Delivery is at-least-once, as on the online lane. A
+  worker that dies mid-batch leaves its rows for the next claim, and a rerun of a failed
+  `execute_bulk` re-emits from wherever the domain's `handle_stream` resumes.
+- **A bulk is not all-or-nothing.** A failure rolls back the segment it is in and is
+  returned. The segments before it stay committed with their work queued, as if the
+  domain had issued them as separate commands. The aggregate is the checkpoint: its
+  stream holds the committed prefix, so `handle_stream` decides where a rerun resumes.
+  The expected version is checked before the first segment only, and another writer
+  may append to the stream between segments.
+- **External facts stay in tables.** The bulk lane is for decisions. A supplier's rows,
+  a file's contents or another system's prices are input the domain reads when it
+  decides, not events (see [Events record facts, not state](#events-record-facts-not-state)).
+- **Register before the first bulk; a bulk Policy cannot be rebuilt from history.** The
+  work is queued at the append, for the Policies registered by then, so one registered
+  after a segment committed never receives that segment, whatever its `StartAt`. A
+  Policy is registered when its runner drains or its worker starts, not when the runner
+  is built: on a fresh database, `drain` the runner once before the first `execute_bulk`.
+
+A command a bulk Policy dispatches is an ordinary online command, so its events reach
+online Policies as any other. A command that fails for good is a
+[dead letter](#failure-handling) for its triggering event, and its row leaves the queue
+with the batch, so one bad record never wedges an import. A busy command
+([ADR-0036](docs/adr/0036-a-busy-command-is-held-not-dead-lettered.md)) ends the batch, and
+its rows are claimed again on the next poll.
+`PolicyStatus::bulk_pending` is the queue depth, so an operator can watch an import
+drain ([Monitoring policy status](#monitoring-policy-status)). The segment size is a
+store setting ([Bulk segment size](#bulk-segment-size)), and the batch a worker claims
+is the Policy's `read_batch_size`.
 
 ### Advisory-lock leader election
 
@@ -2856,11 +3293,19 @@ Two batch sizes control throughput vs checkpoint frequency:
 
 The runner enforces `read_batch_size ≥ checkpoint_batch_size`.
 
+`read_batch_size` bounds one poll, not a policy's throughput. A poll that leaves work it
+knows about — streams it could not finish or reach, or log past where its sweep stopped —
+is followed by the next one at once, after a yield to the runtime and a check for shutdown
+and a change of leadership; the worker waits on the poll interval only once a poll finds
+itself caught up. A backlog is worked through at the speed of its reactions, and the
+interval stays what it is for: the safety net for a missed `NOTIFY`
+([#322](https://github.com/funkode-io/replay/issues/322)).
+
 `read_batch_size` counts positions in the log, not matches: a `stream_filter` decides
 what a policy reacts to, the cursor still walks past everything else
 ([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md)). A
-selective policy over a busy log may need several drains to reach its next event;
-raise `read_batch_size` if that latency matters.
+selective policy over a busy log may need several polls to reach its next event, run
+back to back; raise `read_batch_size` to spend fewer round trips on them.
 
 ### Dispatch timeout
 
@@ -2932,6 +3377,21 @@ value you choose is the longest honest hold, and in this library that is `compac
 it is O(stream length), so a stream long enough to take more than the wait will
 fail the appends queued behind it.
 
+### Bulk segment size
+
+`Cqrs::execute_bulk` commits its events in segments, each one transaction holding the
+segment's events, their inline-projection rows and their bulk work. The segment bounds
+what a bulk holds at once — memory, the stream row, and the commit stamp every online
+Policy and projection catch-up waits behind — and what a failure rolls back: a failure
+mid-bulk leaves the segments before it committed and returns the error
+([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+
+| Setting | Store override | Env var | Default |
+|---------|----------------|---------|---------|
+| Events a bulk append commits per segment | `builder(pool).bulk_segment_size(n)` | `REPLAY_BULK_SEGMENT_SIZE` | `1000` |
+
+Values below 1 are clamped to 1. An online append is one transaction whatever this is.
+
 ### Failure handling
 
 When a dispatch fails the runner classifies the error and responds accordingly:
@@ -2940,6 +3400,7 @@ When a dispatch fails the runner classifies the error and responds accordingly:
 |----------------|-----------|--------|
 | **Business-rule violation** | `ErrorKind::BusinessRuleViolation` | Advance cursor immediately — the event is correct, the domain logic rejected the command. No retry, no dead-letter. |
 | **Retryable** | `Unavailable`, `RateLimited`, `Conflict`, or a dispatch that exceeded its timeout | Exponential back-off, `MAX_DISPATCH_RETRIES` (3) retries after the first attempt — four in all. |
+| **Busy** | `ErrorKind::Busy` — a [command middleware](#command-middleware) answered not now | **Hold**: retry after a back-off doubling from 100 ms to 5 s, for as long as it stays busy, outside the retry budget and never dead-lettered; the first other answer is settled by this table with a fresh budget ([A busy command in a Policy](#a-busy-command-in-a-policy)). |
 | **Permanent** | All other errors, or retries exhausted | Write to `policy_dead_letters`, advance cursor. The policy keeps running. |
 | **Timeout** | The dispatch was still running when its `dispatch_timeout` expired | Abandon it, log at `warn` with the elapsed time, retry; on exhaustion write `error_kind = 'Timeout'` and advance cursor. |
 | **Panic** | The reaction (or a command it dispatched) panicked | Write to `policy_dead_letters` with `error_kind = 'Panic'` and the panic's message, log at `error`, advance cursor. Never retried — a reaction that panicked panics again ([ADR-0016](docs/adr/0016-panicking-reaction-parked-as-a-permanent-failure.md)). |
@@ -3254,9 +3715,9 @@ band. None take an advisory lock or move the policy cursor:
 
 | Method | Reaction | Outcome |
 |--------|----------|---------|
-| `retry_dead_letter(id)` | Re-runs the reaction the row belongs to against **current** aggregate state through the same `Cqrs` path the live drain uses, and settles **every** row that reaction parked. | For the row `id` names: `Resolved` (its command succeeded, was declined with a `BusinessRuleViolation`, or is no longer emitted), `StillFailing` (re-parked in place with its **own** fresh error), `Superseded` (another writer parked that command while the replay ran, and its row was left as it stands), or `NotFound`. |
+| `retry_dead_letter(id)` | Re-runs the reaction the row belongs to against **current** aggregate state through the same `Cqrs` path the live drain uses, and settles **every** row that reaction parked. | For the row `id` names: `Resolved` (its command succeeded, was declined with a `BusinessRuleViolation`, or is no longer emitted), `StillFailing` (re-parked in place with its **own** fresh error), `Superseded` (another writer parked that command while the replay ran, and its row was left as it stands), `Busy` (the replay met a command a middleware answered `Busy` for: every row of the reaction is left parked exactly as it was — retry once the middleware lets commands through), or `NotFound`. |
 | `discard_dead_letter(id)` | None — pure bookkeeping: no `react`, no command, no new event. | `Discarded` or `NotFound`. |
-| `retry_policy_dead_letters(name)` | Bulk: groups the policy's parked rows by the reaction they came from and replays each **once**, oldest-first. | `DeadLetterRetrySummary { reactions_resolved, reactions_still_failing }`. |
+| `retry_policy_dead_letters(name)` | Bulk: groups the policy's parked rows by the reaction they came from and replays each **once**, oldest-first. | `DeadLetterRetrySummary { reactions_resolved, reactions_still_failing, reactions_busy }`. |
 
 The unit of a retry is the **reaction** — one Policy's reaction to one event —
 not the row ([ADR-0021](docs/adr/0021-retry-settles-a-reaction-not-a-row.md)). A
@@ -3297,6 +3758,7 @@ match runner.retry_dead_letter(id).await? {
     DeadLetterRetry::Resolved => { /* this row's command resolved: archived */ }
     DeadLetterRetry::StillFailing => { /* updated in place, still retryable */ }
     DeadLetterRetry::Superseded => { /* another writer parked it mid-replay */ }
+    DeadLetterRetry::Busy => { /* a middleware said not now: left as it was */ }
     DeadLetterRetry::NotFound => { /* nothing matched the id */ }
 }
 
@@ -3515,6 +3977,9 @@ happened", not "nothing is known".
 | `policy is working through its backlog` | the first cursor advance at least 30 s after the previous record | events so far, elapsed |
 | `policy is caught up` | the first poll that finds nothing owed | events in the burst, elapsed |
 | `policy dispatch committed` | every dispatch that commits, at `debug` | event, aggregate, elapsed |
+| `policy dispatch is busy; holding on this event until it runs` | a dispatch first answers `Busy` (`hold = "entered"`) | event, command, reason |
+| `policy dispatch is no longer busy; the hold is over` | the held command answers anything else (`hold = "left"`) | busy attempts, time held |
+| `policy stopped leading while holding a busy command; …` | a shutdown or lost leadership calls a hold off (`hold = "abandoned"`) | busy attempts, time held |
 
 The counts are places the policy advanced over, not reactions executed: a policy whose
 `stream_filter` excludes a whole stream worked through it, and is not caught up until
@@ -3578,6 +4043,7 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 | `last_checkpoint_at` | When the policy last advanced in any stream (staleness signal). |
 | `dead_letter_count` | Number of `policy_dead_letters` rows for this policy. List them with `dead_letters` (see [Listing dead letters](#listing-dead-letters)). |
 | `last_dead_letter_at` | Timestamp of the most recent dead letter, if any. |
+| `bulk_pending` | The bulk lane's queue depth: rows of bulk work queued for this policy and not yet reacted to, falling to `0` as an import drains. `None` for a policy never registered on the bulk lane. A policy on both lanes is listed once, with its online fields and this; a policy only on the bulk lane reports `0` lag. |
 | `condition` | At-a-glance health label (see below). |
 
 `lag` is a subtraction per stream, so a position burned by a failed write does not
@@ -3606,8 +4072,8 @@ nothing behind, or read each stream in its own order and record the **stream pla
 | Condition | When | Meaning |
 |-----------|------|---------|
 | `Degraded` | `dead_letter_count > 0` | At least one event was skipped; needs operator attention. |
-| `Working` | no dead letters, `lag > 0` | Healthy and catching up. |
-| `CaughtUp` | no dead letters, `lag == 0` | Fully drained and up to date. |
+| `Working` | no dead letters, `lag > 0` or `bulk_pending > 0` | Healthy and catching up. |
+| `CaughtUp` | no dead letters, `lag == 0`, no bulk work pending | Fully drained and up to date. |
 
 `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`, `"Working"`,
 `"Degraded"`) for JSON/UI consumers.
@@ -3658,7 +4124,7 @@ None of the three stops a policy, and none of them needs an operator:
 | A write failed after taking a `global_position` | Nothing. The number is burned — `nextval` is not transactional — and a policy that reads no global order never looks at it. The place the write took in its stream *is* handed back, because that counter is a row and rolls back with the transaction. |
 | A write is still running | Its stream waits for it, and only its stream. Every other stream is delivered meanwhile. |
 | A write commits below a policy's sweep, with its leader unchanged | It is nominated on the next poll after its transaction commits. |
-| A leader changes, transaction counter resets, or late-write state exceeds its cap | The full comparison finds the write within one `REPLAY_POLICY_RECONCILE_SECS` cadence, plus the rotation terms in [ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md). |
+| A leader changes, transaction counter resets, or late-write state exceeds its cap | Leader start schedules a full comparison within three poll intervals; a detected counter reset or cap overflow forces one immediately. Each full comparison stops at a candidate batch; remaining work follows the rotation bound in [ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md). |
 
 This is the structural fix for
 [#164](https://github.com/funkode-io/replay/issues/164), where a burned position

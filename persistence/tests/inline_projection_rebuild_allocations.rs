@@ -16,14 +16,12 @@ use replay_persistence::{EventStore, InlineProjection, PersistedEvent};
 
 mod common;
 use common::alloc::{peak_live_bytes, reset_peak, CountingAllocator};
-use common::postgres_image::start_postgres_server;
+use common::postgres_image::postgres_database;
 
 /// Every test binary registers its own global allocator; the counting itself is
 /// shared (`tests/common/alloc.rs`).
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-const POSTGRES_PORT: u16 = 5432;
 
 // ── Fixture: an aggregate whose events carry a fat payload ───────────────────
 
@@ -141,19 +139,12 @@ impl InlineProjection for NoOpProjection {
     }
 }
 
-async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
-    let container = start_postgres_server().await;
-    let host = container.get_host().await.unwrap().to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("Error getting docker port");
+async fn start_pool() -> (PgPool, common::postgres_image::TestDatabase) {
+    let container = postgres_database().await;
 
     let pool = PgPoolOptions::new()
         .max_connections(2)
-        .connect(&format!(
-            "postgres://postgres:postgres@{host}:{port}/postgres"
-        ))
+        .connect(&container.url())
         .await
         .expect("Failed to connect to Postgres");
 
@@ -189,13 +180,14 @@ async fn peak_live_bytes_scale_with_the_flush_size_not_the_history_postgres_test
     }));
 
     store
-        .store_events_stream::<FatStream, _, _>(
+        .store_events_stream::<FatStream, _, _, _>(
             &stream_id,
             "FatStream".to_string(),
             replay::Metadata::default(),
             events,
             None,
             |_: &PersistedEvent<FatEvent>| {},
+            replay_persistence::OpenGate,
         )
         .await
         .expect("seeding history must succeed");
@@ -259,13 +251,14 @@ async fn peak_live_bytes_of_a_catch_up_scale_with_the_flush_size_not_the_gap_pos
         })
     }));
     old_pod
-        .store_events_stream::<FatStream, _, _>(
+        .store_events_stream::<FatStream, _, _, _>(
             &stream_id,
             "FatStream".to_string(),
             replay::Metadata::default(),
             events,
             None,
             |_: &PersistedEvent<FatEvent>| {},
+            replay_persistence::OpenGate,
         )
         .await
         .expect("appending the gap must succeed");

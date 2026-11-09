@@ -15,11 +15,15 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod await_in_flight_commits;
 mod bounded_queries;
+mod command_middleware;
+mod command_middleware_example;
 mod created_filter_index;
 mod dead_letter_listing;
 mod dead_letter_unique_command;
 mod event_commit_txid;
+mod event_lane;
 mod event_ordering_postgres;
 mod event_stream_seq;
 mod global_position_unique;
@@ -27,11 +31,17 @@ mod inline_projection_catch_up;
 mod inline_projection_chunking;
 mod inline_projection_rebuild_chunking;
 mod integration_tests;
+mod policy_backlog;
+mod policy_bulk_lane;
+mod policy_bulk_lane_failures;
+mod policy_bulk_segments;
+mod policy_busy_hold;
 mod policy_cursor_backfill;
 mod policy_daemon;
 mod policy_dead_letter_identity;
 mod policy_late_write;
 mod policy_liveness;
+mod policy_online_ignores_bulk;
 mod policy_panic;
 mod policy_park_once;
 mod policy_per_stream_feed;

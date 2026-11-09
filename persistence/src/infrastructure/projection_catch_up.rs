@@ -28,25 +28,11 @@ use sqlx::{PgConnection, Postgres, QueryBuilder, Row};
 use crate::inline_projection::ErasedInlineProjection;
 use crate::{PersistedEvent, StreamFilter};
 
+use super::advisory_keys::{PROJECTION_LOCK_CLASS, REGISTRY_LOCK_CLASS};
 use super::postgres::PostgresEventStore;
 
 /// A type-erased Postgres inline projection, as the store holds it.
 pub(crate) type ErasedPostgresProjection = dyn ErasedInlineProjection<Exec = PgConnection>;
-
-/// The advisory-lock class every projection lock is taken in.
-///
-/// The two-key form keeps these locks apart from the policy runner's, which use the
-/// one-key form over `hashtext(policy name)`: a Policy and a projection sharing a name must
-/// not exclude each other. The value spells `RPJC`.
-const PROJECTION_LOCK_CLASS: i32 = 0x5250_4A43;
-
-/// The advisory lock on the registry as a whole: `(REGISTRY_LOCK_CLASS, 0)`. A class of its
-/// own so no projection's `hashtext` can land on it. The value spells `RPJR`.
-///
-/// `build()` holds it shared while it builds, and a deletion of streams takes it
-/// exclusively: a projection registered for the first time has no registry row for the
-/// deletion to find and lock by name until its build commits (ADR-0033).
-const REGISTRY_LOCK_CLASS: i32 = 0x5250_4A52;
 
 /// Built-in default for how often the background task catches every projection up.
 pub(crate) const DEFAULT_CATCH_UP_INTERVAL: Duration = Duration::from_secs(60);
@@ -251,20 +237,10 @@ pub(crate) async fn apply_pages(
     };
     let types = projection.event_types();
 
-    // Where the gap can start. Without a lower bound the first page would walk
-    // `global_position` from the beginning of the log to find the recent events above the
-    // horizon; `(commit_txid, global_position)` answers this from the horizon's range.
     let mut after: Option<i64> = match &scope {
         Scope::History => None,
         Scope::Gap { horizon } => {
-            let first: Option<i64> = sqlx::query_scalar(
-                "SELECT MIN(global_position) FROM events WHERE commit_txid >= $1::xid8",
-            )
-            .bind(*horizon)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(crate::db_error)?;
-            match first {
+            match gap_start(&mut *conn, &name, version, cut, horizon).await? {
                 Some(first) => Some(first - 1),
                 None => return Ok(0),
             }
@@ -305,6 +281,47 @@ pub(crate) async fn apply_pages(
     }
 
     Ok(read)
+}
+
+/// The lowest `global_position` a catch-up owes `name` at `version`: above `horizon`,
+/// visible in the cut, without an applied mark. `None` when nothing is owed.
+///
+/// The pages walk `global_position` from here, so without it the first page would walk
+/// from the beginning of the log to find the recent events above the horizon. It reads
+/// the horizon's range — `(commit_txid, global_position)` covers it, though a range that
+/// is most of the log may be cheaper to scan — and never walks `global_position`'s own
+/// index from the start of the log (funkode-io/replay#306):
+///
+/// Keep `OFFSET 0`: without the fence, even a custom plan can walk the position index
+/// from the start (#306). `persistent(false)` plans the range with the current horizon.
+///
+/// This predicate must include every row `load_page` can return; extra rows are safe.
+/// Excluding marked transactions avoids paging them again under a held-back horizon.
+/// A `None` result skips pages, but the caller must still seal (ADR-0032).
+async fn gap_start(
+    conn: &mut PgConnection,
+    name: &str,
+    version: i32,
+    cut: &Cut,
+    horizon: &str,
+) -> Result<Option<i64>, replay::Error> {
+    sqlx::query_scalar(
+        "SELECT MIN(gap.global_position) \
+           FROM (SELECT global_position, commit_txid FROM events \
+                  WHERE commit_txid >= $1::xid8 OFFSET 0) gap \
+          WHERE pg_visible_in_snapshot(gap.commit_txid, $2::pg_snapshot) \
+            AND NOT EXISTS (SELECT 1 FROM projection_applied_transactions a \
+                             WHERE a.projection = $3 AND a.version = $4 \
+                               AND a.txid = gap.commit_txid)",
+    )
+    .persistent(false)
+    .bind(horizon)
+    .bind(cut.snapshot.as_str())
+    .bind(name)
+    .bind(version)
+    .fetch_one(conn)
+    .await
+    .map_err(crate::db_error)
 }
 
 /// Catch `projection` up on the gap above `horizon`, or adopt the log when it has no
@@ -374,6 +391,9 @@ pub(crate) async fn seal(
             AND pg_visible_in_snapshot(commit_txid, $3::pg_snapshot) \
          ON CONFLICT DO NOTHING",
     )
+    // Unnamed, like the gap's starting point: a generic plan of this range read is planned
+    // blind to the horizon, and nothing would stop it scanning `events` (funkode-io/replay#306).
+    .persistent(false)
     .bind(name)
     .bind(version)
     .bind(&cut.snapshot)
@@ -494,8 +514,12 @@ async fn load_page(conn: &mut PgConnection, query: PageQuery<'_>) -> Result<Page
         // Saturating rather than `as`: a wrapped cast would send a negative LIMIT.
         .push_bind(i64::try_from(query.limit).unwrap_or(i64::MAX));
 
+    // A gap page is unnamed too, so it is planned with its horizon and cursor rather than
+    // generically: under a held-back horizon a generic plan could read the whole range above
+    // it for every page. A rebuild's pages have no horizon and stay cached.
     let rows = builder
         .build()
+        .persistent(!matches!(query.scope, Scope::Gap { .. }))
         .fetch_all(&mut *conn)
         .await
         .map_err(crate::db_error)?;

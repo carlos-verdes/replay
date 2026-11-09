@@ -1,4 +1,5 @@
 mod aggregate_version;
+mod command_middleware;
 mod cqrs;
 mod error;
 mod filters;
@@ -17,6 +18,9 @@ mod store;
 mod stream_scope;
 
 pub use aggregate_version::AggregateVersion;
+pub use command_middleware::{
+    Causation, CommandContext, CommandContextMut, CommandMiddleware, Next, Outcome,
+};
 pub use cqrs::Cqrs;
 pub use error::{concurrency_error, db_error, deser_error, ser_error};
 pub use filters::StreamFilter;
@@ -27,7 +31,7 @@ pub use inline_projection::InlineProjection;
 pub use persisted_event::PersistedEvent;
 // The rule itself lives in the core crate (ADR-0027); re-exported here permanently so a
 // consumer of the runner has one import and the runner's docs stay self-contained.
-pub use policy::{PolicySettings, StartAt};
+pub use policy::{Lanes, PolicySettings, StartAt};
 pub use policy_liveness::{Liveness, WorkerLiveness};
 pub use policy_runner::{
     DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Escalation, EscalationReason,
@@ -40,7 +44,7 @@ pub use policy_status::{
 };
 pub use query::Query;
 pub use replay::{AggregatePolicy, Dispatch, ObservedEvent, Policy, TargetedCommand};
-pub use store::{CompactionOutcome, EventSink, EventStore, NoSink};
+pub use store::{CommitGate, CompactionOutcome, EventSink, EventStore, NoSink, OpenGate};
 pub use stream_scope::StreamScope;
 
 /// Convenience re-exports of the most commonly used types and traits across
@@ -62,12 +66,13 @@ pub mod prelude {
 
     // Persistence types from this crate
     pub use super::{
-        AggregateVersion, CompactionOutcome, Cqrs, DeadLetter, DeadLetterDiscard, DeadLetterFilter,
-        DeadLetterRetry, DeadLetterRetrySummary, DeletedStreams, Dispatch, Escalation,
-        EscalationReason, EventSink, EventStore, InMemoryEventStore, InlineProjection, Liveness,
-        NoSink, ObservedEvent, PersistedEvent, Policy, PolicyCondition, PolicyRunner,
-        PolicyRunnerBuilder, PolicyRunnerDaemon, PolicySettings, PolicyStatus, PolicyStatusStore,
-        PostgresEventStore, PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter,
-        StreamScope, WorkerLiveness, WorkerSupervision,
+        AggregateVersion, CommandContext, CommandMiddleware, CommitGate, CompactionOutcome, Cqrs,
+        DeadLetter, DeadLetterDiscard, DeadLetterFilter, DeadLetterRetry, DeadLetterRetrySummary,
+        DeletedStreams, Dispatch, Escalation, EscalationReason, EventSink, EventStore,
+        InMemoryEventStore, InlineProjection, Lanes, Liveness, Next, NoSink, ObservedEvent,
+        OpenGate, PersistedEvent, Policy, PolicyCondition, PolicyRunner, PolicyRunnerBuilder,
+        PolicyRunnerDaemon, PolicySettings, PolicyStatus, PolicyStatusStore, PostgresEventStore,
+        PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter, StreamScope,
+        WorkerLiveness, WorkerSupervision,
     };
 }

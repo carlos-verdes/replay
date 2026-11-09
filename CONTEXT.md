@@ -60,7 +60,7 @@ takes an [Observed event] and returns dispatches. A rule whose commands all go t
 aggregate type declares it instead (`AggregatePolicy`) and returns `(StreamId, Command)`
 pairs; a blanket impl makes it a Policy, so a type implements one trait or the other,
 never both ([ADR-0028](docs/adr/0028-a-single-target-policy-declares-its-target.md)). How it is driven — feed, start
-position, batches, dispatch timeout, causation depth — is `PolicySettings`, given to the
+position, [Lane], batches, dispatch timeout, causation depth — is `PolicySettings`, given to the
 [Policy runner] at registration ([ADR-0027](docs/adr/0027-the-policy-rule-is-core-vocabulary.md)).
 _Avoid_: reactor, saga, process manager, automation, trigger, reaction.
 
@@ -117,11 +117,13 @@ Which streams to read is found three ways. A sweep of the log by [Global positio
 poll is fast, and may pass a write that had not committed yet (a [Late write]). A
 late-write lookup every poll finds those by their [Commit stamp] once their transaction
 ends ([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). A
-reconciliation compares every stream's head with the Policy's place: at leader start,
-on a manual drain, and on a slow cadence as a safety net. None of them decides what is
-owed; they nominate streams. The sweep and the reconciliation take a
-batch and resume where the last one stopped, so "bounded" costs a rotation rather than a
-stream nobody looks at.
+reconciliation compares a bounded window of stream heads with the Policy's places: one
+window on its slow safety cadence, and bounded keyset pages at leader start or on a manual
+drain until it finds a candidate batch or completes a pass, wrapping at the saved rotation.
+A caught-up full comparison costs roughly `ceil(tracked streams / window)` statements plus
+boundary probes in one poll, delaying delivery until it finishes. None of these paths
+decides what is owed; they nominate streams. The sweep and the reconciliation resume where the last one
+stopped, so "bounded" costs a rotation rather than a stream nobody looks at.
 
 Which streams a poll reads, in what order, how far its event budget gets and where that
 leaves the rotation is **one decision, taken over what the two nomination queries
@@ -144,22 +146,37 @@ _Avoid_: subscription, stream, queue, backlog.
 
 ### Lane
 
-Which of two delivery paths an appended event takes to a [Policy]. The **online lane**,
-the default, is the [Policy feed]: places, sweep, late-write lookup, reconciliation. The
-**bulk lane** is a work queue the append fills in its own transaction and a worker
-drains in batches, for decisions that are bulk by design, such as a file import's
-accepted records
-([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)). An
-event is stamped with its lane at the append; a Policy declares at registration which
-lane or lanes it consumes. The online lane never reads a bulk event.
+Which of two delivery paths an appended event takes to a [Policy]. The **online lane**
+is the default and is the [Policy feed]: places, sweep, late-write lookup and
+reconciliation. The **bulk lane** is a work queue ([Bulk work]). The append fills it in
+its own transaction, and a worker in the Policy's [Leader] drains it in batches. It is
+for decisions that are bulk by design, such as a file import's accepted records
+([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+
+An event is stamped with its lane when it is appended (`events.lane`): online through
+`Cqrs::execute`, bulk through `Cqrs::execute_bulk`
+([`persistence/src/cqrs.rs`](persistence/src/cqrs.rs)). A bulk append commits in
+segments of `bulk_segment_size` events, and a failure rolls back only the segment it is
+in. A Policy declares at registration which lanes it consumes, with
+`PolicySettings::on_lanes(Lanes::Online | Lanes::Bulk | Lanes::Both)`
+([`persistence/src/policy.rs`](persistence/src/policy.rs)). The same `react` serves
+both lanes. The online feed never delivers a bulk event: it passes one as it passes a
+row its stream filter excludes. Each lane keeps a stream's events in order, and nothing
+orders one lane against the other.
 _Avoid_: channel, priority, queue (for the online lane), batch mode.
 
 ### Bulk work
 
-One row per bulk-lane event per [Policy] that consumes the bulk lane, inserted by the
-append and deleted by the worker that reacted to it. The table holds only pending work,
-so it is sized by what is owed, never by history, and nothing reconciles it
-([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+One row of `policy_bulk_work` per bulk-lane event per [Policy] that consumes the bulk
+lane and tracks the event's stream. The append inserts it, and the worker that reacted
+to it deletes it. The table holds only pending work, so it is sized by what is owed,
+never by history, and nothing reconciles it. A Policy's registration on the bulk lane is
+its row of `policy_bulk_registrations`, which only widens. The worker claims a batch with
+`FOR UPDATE SKIP LOCKED`, reacts, dispatches grouped by target stream, and deletes the
+batch on the claim transaction, so a worker that dies leaves its rows for the next
+claim. Its queue depth is `PolicyStatus::bulk_pending` ([Policy status])
+([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md),
+[`persistence/src/policy_runner/bulk_lane.rs`](persistence/src/policy_runner/bulk_lane.rs)).
 _Avoid_: outbox, job, task, pending event.
 
 ### Causation
@@ -170,6 +187,40 @@ reading the resulting events; it is not offered to the target [Aggregate], which
 no metadata in `handle`. The chain of causation is what bounds how deep one event may
 cascade into further reactions.
 _Avoid_: trigger, cause, origin.
+
+### Command middleware
+
+Code a consumer registers once to run around every command: before the command
+runs, which may stop it or add to its metadata; just before its append commits,
+which may roll the append back; and after it has finished, which only observes.
+Each of the first two answers continue, [Busy], or an error. Middleware runs in the
+order it was registered, on every command — an application's and a [Policy]'s alike,
+the latter told apart by its [Causation] — and on nothing that is not a command: a
+direct append, a compaction, a [Stream deletion], a [Rebuild] or a [Catch-up]. It is
+not a [Projection] and the registry knows nothing of it
+([ADR-0035](docs/adr/0035-a-command-passes-through-middleware-before-it-runs-and-before-it-commits.md)).
+_Avoid_: interceptor, hook, filter, guard, plugin.
+
+### Commit gate
+
+The point in an append where the store asks the [Command middleware] whether to
+commit, after the events and every [Inline projection] write are in place. Anything
+but continue rolls the append back. Once a gate has let an append through, a flag
+set afterwards cannot be missed: the store makes waiting for every such append
+possible, so switching a rule on and then waiting leaves no append that checked the
+old rule still to commit
+([ADR-0035](docs/adr/0035-a-command-passes-through-middleware-before-it-runs-and-before-it-commits.md)).
+_Avoid_: pre-commit hook, commit check.
+
+### Busy
+
+The answer "not now": the command is neither wrong nor failed and may succeed
+later, unchanged — maintenance mode is the case that named it. A caller sees it as
+its own kind of error. The [Policy runner] holds a busy command, retrying it for as
+long as it stays busy, and never parks it as a [Dead letter]
+([ADR-0036](docs/adr/0036-a-busy-command-is-held-not-dead-lettered.md)). A refusal
+that will never succeed is an error, not Busy.
+_Avoid_: unavailable, paused, deferred, refused.
 
 ### Dead letter
 
@@ -228,7 +279,9 @@ does, and each row is settled by its own command's outcome, resolved rows
 archived and still-failing ones left retryable with their own error
 ([ADR-0021](docs/adr/0021-retry-settles-a-reaction-not-a-row.md)). A retry
 summary therefore counts reactions where `dead_letter_count` counts parked
-commands.
+commands. A retry whose replay meets a [Busy] command settles nothing: the rows stay
+parked as they were and the reaction is reported busy
+([ADR-0036](docs/adr/0036-a-busy-command-is-held-not-dead-lettered.md)).
 Distinct from a [Rebuild], which resets and replays a whole [Projection].
 _Avoid_: reprocess, requeue, redrive.
 
@@ -287,7 +340,8 @@ _controlling_ a Policy (acting on its failures by [Retry] or [Discard] of a
 [Liveness]. Its `lag` is an exact count of events not yet passed, summed over the streams
 the Policy is behind on, and `streams_behind` says how widely that is spread — one stream
 a million events behind and a million streams one event behind are the same lag and very
-different problems.
+different problems. A Policy on the bulk lane also reports `bulk_pending`, the depth of
+its [Bulk work] queue, and pending bulk work keeps it `Working`.
 _Avoid_: state, policy state, health check.
 
 ### Blocked policy
@@ -468,8 +522,9 @@ by a record when work appears and the [Caught up] record that ends it, with a
 bounded progress record in between while a backlog is still draining
 ([ADR-0021](docs/adr/0021-a-policy-narrates-its-transitions.md)). Output is
 proportional to how often a Policy changes state, not to how much work it does,
-which is what keeps an idle Policy's silence readable as a signal. Per-dispatch
-detail exists at `debug` and is off by default.
+which is what keeps an idle Policy's silence readable as a signal. A hold on a
+[Busy] command is an edge too: one record on entering it and one on leaving, never
+one per attempt. Per-dispatch detail exists at `debug` and is off by default.
 _Avoid_: logging, tracing, audit trail, telemetry.
 
 ### Scoped URN
@@ -520,7 +575,8 @@ the store.
 ### Catch-up
 
 What an [Inline projection] does about the events of transactions that did not apply it:
-it applies them later, once per projection version, in [Global position] order. Run by
+it applies them later, once per projection version: each stream's events in that stream's
+order, by [Global position], and no order promised across streams. Run by
 `build()` at startup, by a background task on a cadence, and on demand. Every append
 records an **applied mark** for each projection it applied, so a catch-up skips those, and
 what is owed is decided by [Commit stamp] against the [Catch-up horizon], never by a
@@ -634,3 +690,8 @@ it:
 [Late write]: #late-write
 [Async projection]: #async-projection
 [Projection]: #projection
+[Command middleware]: #command-middleware
+[Commit gate]: #commit-gate
+[Busy]: #busy
+[Lane]: #lane
+[Bulk work]: #bulk-work
