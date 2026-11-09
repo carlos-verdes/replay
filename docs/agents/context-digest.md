@@ -1,6 +1,6 @@
 # Context digest: replay
 
-<!-- built from d9372e8 fingerprint c6c4f1e46443f5f9 on 2026-11-05; refresh: run the context-digest skill -->
+<!-- built from f019ffa fingerprint 4988a8bcf3478f7a on 2026-11-09; refresh: run the context-digest skill -->
 
 A map, not a summary: one line per term, decision, section and tunable, each pointing at
 the authoritative text. Read this, then only the sections your ticket touches.
@@ -152,6 +152,7 @@ Numbers 0018 and 0021 are each used twice; cite by file name.
 - [WASM Support](../../README.md#wasm-support): when touching `es` or `macros` traits. [Aggregate Trait](../../README.md#aggregate-trait), [Async Services in WASM](../../README.md#async-services-in-wasm), [Testing WASM](../../README.md#testing-wasm).
 - [Filtering Events with `StreamFilter`](../../README.md#filtering-events-with-streamfilter): [Available filters](../../README.md#available-filters), [Combining filters](../../README.md#combining-filters), per-filter examples, use in a `Query` and directly with the store.
 - [Inline Projections (Postgres)](../../README.md#inline-projections-postgres): [When to use it](../../README.md#when-to-use-it), [Migrations](../../README.md#migrations) (how consumers apply `persistence/tests/migrations`), [Lowest-ceremony path: register a Postgres event handler](../../README.md#lowest-ceremony-path-register-a-postgres-event-handler), [Full control: implement `InlineProjection`](../../README.md#full-control-implement-inlineprojection), [Runtime behavior](../../README.md#runtime-behavior), [Batching: a single append may arrive as several calls](../../README.md#batching-a-single-append-may-arrive-as-several-calls), [Rolling deploys: catching up on appends that did not apply it](../../README.md#rolling-deploys-catching-up-on-appends-that-did-not-apply-it).
+- [Command middleware](../../README.md#command-middleware): [The three hooks](../../README.md#the-three-hooks), [Example: maintenance mode](../../README.md#example-maintenance-mode), [A busy command in a Policy](../../README.md#a-busy-command-in-a-policy).
 - [Querying Events from Multiple Aggregates](../../README.md#querying-events-from-multiple-aggregates): `query_events!`. [What the Macro Generates](../../README.md#what-the-macro-generates), [Use Cases](../../README.md#use-cases), [Example: Building a User Activity Log](../../README.md#example-building-a-user-activity-log).
 - [Stream Compaction](../../README.md#stream-compaction): [The `Compactable` trait](../../README.md#the-compactable-trait), the bank-account example, [Running compaction via `Cqrs`](../../README.md#running-compaction-via-cqrs), [What compaction does to an event's numbers](../../README.md#what-compaction-does-to-an-events-numbers), [Skipping unchanged streams](../../README.md#skipping-unchanged-streams-needs_compaction), [Compacting a whole scope](../../README.md#compacting-a-whole-scope-streams_needing_compaction).
 - [Deleting streams](../../README.md#deleting-streams): when a stream must be gone, not shortened.
