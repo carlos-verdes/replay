@@ -204,8 +204,9 @@ import drain. Pending bulk work keeps a Policy `Working`.
   row locks give the claim a transaction id, and that transaction stays in progress while
   the batch dispatches. Commits after it are still applied, by their marks, as with any
   long transaction (ADR-0032), but the marks are kept and each catch-up round reads the
-  range above the horizon until the claim commits. `read_batch_size` and the dispatch
-  timeout limit how long a claim lasts.
+  range above the horizon until the claim commits. No deadline covers a whole claim:
+  `read_batch_size` limits its events and the dispatch timeout limits each command
+  attempt, so a slow reaction or a large fan-out of commands prolongs the hold.
 - **A draining bulk Policy can hold two connections at once**: its claim, and the one a
   dispatch needs to load and append. When the runner and the store share a pool, nothing
   reserves capacity between them. If claims take every connection, dispatches and online
