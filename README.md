@@ -1738,7 +1738,9 @@ named type, custom `init`, or more involved logic than a single handler closure.
   other processes appended without applying the projection (see
   [Rolling deploys](#rolling-deploys-catching-up-on-appends-that-did-not-apply-it)).
   `builder.plan().await?` reports what `build()` would do without doing it
-  ([below](#planning-a-build-what-build-would-do)).
+  ([below](#planning-a-build-what-build-would-do)). A registration the code dropped is
+  [retired](#retiring-a-projection-the-code-no-longer-registers) by hand; no `build()`
+  removes a row.
 - On each successful append, the store constructs `PersistedEvent`s from the metadata returned by
   `append_event(...)` and passes them to every registered projection.
 - Projection handlers run inside the **same Postgres transaction** as the event append.
@@ -1909,6 +1911,38 @@ fn event_types(&self) -> Option<Vec<String>> {
 A rebuild over a long, mixed log is where this pays: one downstream rebuild went from ~35 s
 to ~1 s. List every type the projection's `Event` can hold — a type left out never reaches
 `handle`.
+
+### Retiring a projection the code no longer registers
+
+No `build()` ever removes a registry row, so a projection you stop registering — a guard
+that moved into [command middleware](#command-middleware), say — stays in the `projections`
+table with its version and its applied marks, and reads as a live component to anyone who
+lists the registry. `PostgresEventStore::retire_projection` takes it out, in one
+transaction, from a store that no longer registers it:
+
+```rust,ignore
+let retired = store.retire_projection("maintenance_guard").await?;
+if retired.was_registered() {
+    println!("retired maintenance_guard v{}", retired.version.unwrap());
+}
+```
+
+What goes: the registry row, with the version it recorded, and every applied mark written
+for the name at any version. Your own view table is yours to drop, as with
+[deleting streams](#deleting-streams). The call is idempotent — a name with no row returns
+`version: None` and deletes whatever marks it finds — so it can run at every startup of the
+release that dropped the registration. A name the calling store still registers is refused
+with `InvalidInput` and nothing is changed.
+
+Safe during a rolling deploy: a replica of the previous release that still registers the
+projection keeps appending, since a mark needs no row, and its
+[catch-up](#rolling-deploys-catching-up-on-appends-that-did-not-apply-it) finds no row and
+does nothing. Only a *restart* of such a replica registers the projection again, as a first
+registration, running its `init` and replaying the history into a view the new release no
+longer reads. Call `retire_projection` again once every process runs the new release: that
+call takes the row back if a restart wrote it, and the marks the old replicas' appends left
+in the meantime. The retirement waits for a `build()` or a catch-up of the projection in any
+process, bounded by the [stream lock wait](#stream-lock-wait).
 
 Inline projections are Postgres-only. The in-memory store remains useful for tests, but the
 transactional guarantee belongs to the Postgres backend.

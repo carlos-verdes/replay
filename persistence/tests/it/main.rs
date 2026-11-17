@@ -51,6 +51,7 @@ mod policy_retry_unit;
 mod policy_supervision;
 mod policy_timeout;
 mod policy_tracks_stream_types;
+mod projection_retirement;
 mod single_target_policy;
 mod stream_creation_race;
 mod stream_deletion;

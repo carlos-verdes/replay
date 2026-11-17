@@ -26,7 +26,7 @@ pub use error::{concurrency_error, db_error, deser_error, ser_error};
 pub use filters::StreamFilter;
 pub use infrastructure::{
     BuildPlan, DeletedStreams, InMemoryEventStore, PlannedAction, PlannedProjection,
-    PostgresEventStore, PostgresInlineProjection,
+    PostgresEventStore, PostgresInlineProjection, RetiredProjection,
 };
 pub use inline_projection::InlineProjection;
 pub use persisted_event::PersistedEvent;
