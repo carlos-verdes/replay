@@ -3,8 +3,8 @@
 //!
 //! The consumer's shape: a maintenance guard was an inline projection, then moved into
 //! command middleware, and the old registration had nowhere to go. Every test asserts what
-//! an operator can see — the registry, the marks, what a replica of the previous release
-//! can still do — never the statements the retirement ran.
+//! an operator can see — the registry, the marks, the view, what a replica of the previous
+//! release can still do — never the statements the retirement ran.
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -51,7 +51,9 @@ impl replay::EventStream for Gauge {
     }
 }
 
-/// A projection with no view of its own, counting what the store asks of it.
+/// A projection with a view that adds up — one row per event, no key — counting how often
+/// the store asks it to `init`. What a first registration replays into a view that already
+/// has rows is visible as rows.
 struct Guard {
     name: &'static str,
     version: i32,
@@ -80,20 +82,35 @@ impl InlineProjection for Guard {
         self.version
     }
 
-    async fn init(&mut self, _conn: &mut Self::Exec) -> Result<(), replay::Error> {
+    async fn init(&mut self, conn: &mut Self::Exec) -> Result<(), replay::Error> {
         self.inits.fetch_add(1, Ordering::SeqCst);
+        sqlx::query("CREATE TABLE IF NOT EXISTS guard_view (event_id UUID NOT NULL)")
+            .execute(conn)
+            .await
+            .map_err(replay_persistence::db_error)?;
         Ok(())
     }
 
-    async fn reset(&mut self, _conn: &mut Self::Exec) -> Result<(), replay::Error> {
+    async fn reset(&mut self, conn: &mut Self::Exec) -> Result<(), replay::Error> {
+        sqlx::query("TRUNCATE guard_view")
+            .execute(conn)
+            .await
+            .map_err(replay_persistence::db_error)?;
         Ok(())
     }
 
     async fn handle(
         &mut self,
-        _conn: &mut Self::Exec,
-        _events: &[PersistedEvent<Self::Event>],
+        conn: &mut Self::Exec,
+        events: &[PersistedEvent<Self::Event>],
     ) -> Result<(), replay::Error> {
+        for event in events {
+            sqlx::query("INSERT INTO guard_view (event_id) VALUES ($1)")
+                .bind(event.id)
+                .execute(&mut *conn)
+                .await
+                .map_err(replay_persistence::db_error)?;
+        }
         Ok(())
     }
 }
@@ -156,6 +173,14 @@ async fn registry(pool: &PgPool) -> Vec<(String, i32)> {
         .expect("reading the registry must succeed")
 }
 
+/// Rows in the guard's view.
+async fn view_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM guard_view")
+        .fetch_one(pool)
+        .await
+        .expect("counting the view must succeed")
+}
+
 /// How many applied marks `name` has, at any version.
 async fn marks(pool: &PgPool, name: &str) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM projection_applied_transactions WHERE projection = $1")
@@ -166,7 +191,7 @@ async fn marks(pool: &PgPool, name: &str) -> i64 {
 }
 
 /// The guard's row and marks go together, and a second retirement finds nothing: the call
-/// can run at every startup.
+/// can run at every startup. The view is the application's and stays.
 #[tokio::test]
 async fn retiring_takes_the_registry_row_and_its_marks_and_is_idempotent_postgres_test() {
     let (pool, _container) = start_pool().await;
@@ -194,6 +219,11 @@ async fn retiring_takes_the_registry_row_and_its_marks_and_is_idempotent_postgre
     assert!(retired.applied_marks > 0, "{retired:?}");
     assert_eq!(registry(&pool).await, vec![]);
     assert_eq!(marks(&pool, "maintenance_guard").await, 0);
+    assert_eq!(
+        view_rows(&pool).await,
+        2,
+        "the view is the application's to drop"
+    );
 
     let again = new
         .retire_projection("maintenance_guard")
@@ -209,16 +239,19 @@ async fn retiring_takes_the_registry_row_and_its_marks_and_is_idempotent_postgre
     assert!(!again.was_registered());
 }
 
-/// A replica of the previous release keeps working after the retirement: it appends, its
-/// catch-up does nothing, and only a restart registers the guard again — which the next
-/// retirement takes back.
+/// Why the README says to retire once every process runs the new release. A *running*
+/// replica of the previous release is unharmed: it appends, applies the guard live, and its
+/// catch-up does nothing. A replica that *restarts* registers the guard again as a first
+/// registration and replays the whole history into the view as it stands, with no reset —
+/// so a view that adds up is doubled. The next retirement takes the row back.
 #[tokio::test]
-async fn a_replica_of_the_previous_release_is_unharmed_and_a_restart_is_retired_again_postgres_test(
-) {
+async fn a_restart_of_the_previous_release_replays_into_the_view_as_it_stands_postgres_test() {
     let (pool, _container) = start_pool().await;
 
     let old = previous_release(&pool, Guard::new("maintenance_guard", 1)).await;
     measure(&old, "boiler", 1).await;
+    measure(&old, "boiler", 2).await;
+    assert_eq!(view_rows(&pool).await, 2);
 
     let new = new_release(&pool).await;
     let retired = new
@@ -227,9 +260,14 @@ async fn a_replica_of_the_previous_release_is_unharmed_and_a_restart_is_retired_
         .expect("retiring must succeed");
     assert_eq!(retired.version, Some(1));
 
-    // The old replica is still serving: it appends, and marks the append for the guard it
-    // registers, with no row to belong to.
-    measure(&old, "boiler", 2).await;
+    // The old replica is still serving: it appends, applies the guard live, and marks the
+    // append for the guard it registers, with no row to belong to.
+    measure(&old, "boiler", 3).await;
+    assert_eq!(
+        view_rows(&pool).await,
+        3,
+        "the running replica still applies live"
+    );
     assert_eq!(
         registry(&pool).await,
         vec![],
@@ -245,7 +283,8 @@ async fn a_replica_of_the_previous_release_is_unharmed_and_a_restart_is_retired_
     assert_eq!(registry(&pool).await, vec![]);
     drop(old);
 
-    // A restart of the old release is a first registration again.
+    // A restart of the old release is a first registration again: init, then the whole
+    // history replayed into the three rows already there.
     let restarted_guard = Guard::new("maintenance_guard", 1);
     let inits = restarted_guard.inits.clone();
     let restarted = previous_release(&pool, restarted_guard).await;
@@ -253,6 +292,11 @@ async fn a_replica_of_the_previous_release_is_unharmed_and_a_restart_is_retired_
     assert_eq!(
         registry(&pool).await,
         vec![("maintenance_guard".to_string(), 1)]
+    );
+    assert_eq!(
+        view_rows(&pool).await,
+        6,
+        "a first registration replays into the view as it stands: 3 events over 3 rows"
     );
     drop(restarted);
 
@@ -286,7 +330,8 @@ async fn a_store_cannot_retire_a_projection_it_registers_postgres_test() {
 }
 
 /// A retirement waits for a build or a catch-up of the projection in another process, and
-/// the wait is bounded: one that runs out is `Unavailable`, and changes nothing.
+/// the wait is bounded: one that runs out is `Unavailable`, names the projection, and
+/// changes nothing.
 #[tokio::test]
 async fn retiring_waits_for_the_projection_lock_and_gives_up_when_the_wait_runs_out_postgres_test()
 {
@@ -309,6 +354,10 @@ async fn retiring_waits_for_the_projection_lock_and_gives_up_when_the_wait_runs_
         .await
         .expect_err("a retirement whose wait runs out must be refused");
     assert_eq!(refused.kind(), replay::ErrorKind::Unavailable, "{refused}");
+    assert!(
+        refused.to_string().contains("maintenance_guard"),
+        "the error names the projection it waited for: {refused}"
+    );
     assert_eq!(
         registry(&pool).await,
         vec![("maintenance_guard".to_string(), 1)]
