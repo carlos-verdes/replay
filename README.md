@@ -1934,15 +1934,16 @@ for the name at any version. Your own view table is yours to drop, as with
 release that dropped the registration. A name the calling store still registers is refused
 with `InvalidInput` and nothing is changed.
 
-Safe during a rolling deploy: a replica of the previous release that still registers the
-projection keeps appending, since a mark needs no row, and its
-[catch-up](#rolling-deploys-catching-up-on-appends-that-did-not-apply-it) finds no row and
-does nothing. Only a *restart* of such a replica registers the projection again, as a first
-registration, running its `init` and replaying the history into a view the new release no
-longer reads. Call `retire_projection` again once every process runs the new release: that
-call takes the row back if a restart wrote it, and the marks the old replicas' appends left
-in the meantime. The retirement waits for a `build()` or a catch-up of the projection in any
-process, bounded by the [stream lock wait](#stream-lock-wait).
+**Call it once every process runs the release that dropped the registration.** A replica of
+the previous release that is *running* is unharmed: it keeps appending, since a mark needs no
+row, and its [catch-up](#rolling-deploys-catching-up-on-appends-that-did-not-apply-it) finds
+no row and does nothing. One that *restarts* after the retirement registers the projection
+again as a first registration: it runs `init` and replays the whole history into the view as
+it stands, with no `reset` — a view that adds up is doubled, one with a unique key fails to
+start. Retire after the rollout; and since the call is idempotent, run it again if a restart
+did slip in: that takes the row back, with the marks the old replicas' appends left. The
+retirement waits for a `build()` or a catch-up of the projection in any process, bounded by
+the [stream lock wait](#stream-lock-wait).
 
 Inline projections are Postgres-only. The in-memory store remains useful for tests, but the
 transactional guarantee belongs to the Postgres backend.

@@ -153,6 +153,30 @@ fn stream_lock_error(
     .with_context("stream_lock_wait_ms", limit)
 }
 
+/// Map a failure from a statement that takes an inline projection's advisory lock, or the
+/// registry's, on behalf of `operation`: the wait is for a build or a catch-up of the
+/// projection in some process, never for a stream row, and the error says so.
+fn projection_lock_error(
+    error: sqlx::Error,
+    projection: &str,
+    wait: Duration,
+    operation: &'static str,
+) -> replay::Error {
+    if !crate::lock_wait::is_lock_not_available(&error) {
+        return crate::db_error(error)
+            .with_operation(operation)
+            .with_context("projection", projection);
+    }
+    let limit = crate::lock_wait::limit_ms(wait);
+    replay::Error::unavailable(format!(
+        "waited {limit}ms for a build or a catch-up of inline projection `{projection}` to \
+         finish without it doing so"
+    ))
+    .with_operation(operation)
+    .with_context("projection", projection)
+    .with_context("stream_lock_wait_ms", limit)
+}
+
 /// How long one attempt of `await_in_flight_commits` waits for the commit gate's lock.
 ///
 /// Always finite: a stream lock wait of zero means "wait forever" for an append, but an
@@ -1219,13 +1243,15 @@ impl PostgresEventStore {
     /// (`stream_lock_wait` on the [builder](PostgresEventStore::builder)), and one that runs
     /// out is [`replay::ErrorKind::Unavailable`], to be retried.
     ///
-    /// Safe during a rolling deploy: a replica of the previous release that still registers
-    /// the projection keeps appending — a mark needs no row — and its catch-up finds no row
-    /// and does nothing. Only a *restart* of such a replica registers the projection again,
-    /// as a first registration, running its `init` and replaying the history into a view the
-    /// new release no longer reads. Call it again once every process runs the release that
-    /// dropped the registration: that second call takes the row back if a restart wrote it,
-    /// and the marks the previous release's appends left in the meantime.
+    /// **Call it once every process runs the release that dropped the registration.** A
+    /// replica of the previous release that is *running* is unharmed: it keeps appending,
+    /// since a mark needs no row, and its catch-up finds no row and does nothing. One that
+    /// *restarts* after the retirement registers the projection again as a first
+    /// registration: it runs `init` and replays the whole history into the view as it
+    /// stands, with no `reset` — a view that adds up is doubled, one with a unique key fails
+    /// to start. Retire after the rollout; and since the call is idempotent, run it again if
+    /// a restart did slip in: that takes the row back, with the marks the previous release's
+    /// appends left.
     pub async fn retire_projection(&self, name: &str) -> Result<RetiredProjection, replay::Error> {
         const OPERATION: &str = "retire_projection";
 
@@ -1256,9 +1282,9 @@ impl PostgresEventStore {
         crate::lock_wait::bound(&mut tx, self.stream_lock_wait)
             .await
             .map_err(failed)?;
-        retirement::lock(&mut tx, name)
-            .await
-            .map_err(|error| stream_lock_error(error, name, self.stream_lock_wait, OPERATION))?;
+        retirement::lock(&mut tx, name).await.map_err(|error| {
+            projection_lock_error(error, name, self.stream_lock_wait, OPERATION)
+        })?;
 
         let applied_marks = retirement::delete_marks(&mut tx, name)
             .await
