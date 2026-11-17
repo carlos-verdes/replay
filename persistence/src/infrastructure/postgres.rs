@@ -18,6 +18,7 @@ use uuid::Uuid;
 use super::advisory_keys::COMMIT_GATE_LOCK_CLASS;
 use super::build_plan::{BuildPlan, PlannedAction, PlannedProjection};
 use super::projection_catch_up::{self as catch_up, Cut, ErasedPostgresProjection, Scope};
+use super::projection_retirement::{self as retirement, RetiredProjection};
 use super::stream_deletion::{self as deletion, DeletedStreams};
 use crate::inline_projection::InlineProjection;
 use crate::{CommitGate, CompactionOutcome, EventSink, EventStore, PersistedEvent, StreamFilter};
@@ -149,6 +150,30 @@ fn stream_lock_error(
     ))
     .with_operation(operation)
     .with_context("stream_id", stream_id)
+    .with_context("stream_lock_wait_ms", limit)
+}
+
+/// Map a failure from a statement that takes an inline projection's advisory lock, or the
+/// registry's, on behalf of `operation`: the wait is for a build or a catch-up of the
+/// projection in some process, never for a stream row, and the error says so.
+fn projection_lock_error(
+    error: sqlx::Error,
+    projection: &str,
+    wait: Duration,
+    operation: &'static str,
+) -> replay::Error {
+    if !crate::lock_wait::is_lock_not_available(&error) {
+        return crate::db_error(error)
+            .with_operation(operation)
+            .with_context("projection", projection);
+    }
+    let limit = crate::lock_wait::limit_ms(wait);
+    replay::Error::unavailable(format!(
+        "waited {limit}ms for a build or a catch-up of inline projection `{projection}` to \
+         finish without it doing so"
+    ))
+    .with_operation(operation)
+    .with_context("projection", projection)
     .with_context("stream_lock_wait_ms", limit)
 }
 
@@ -1194,6 +1219,93 @@ impl PostgresEventStore {
             "deleted streams with their places and dead letters"
         );
         Ok(deleted)
+    }
+
+    /// Retire an inline projection this process no longer registers: delete its registry
+    /// row and its applied marks, in one transaction, and return what was there.
+    ///
+    /// A registration the code dropped — a guard that moved into
+    /// [command middleware](crate::CommandMiddleware), say — leaves its row in the
+    /// `projections` registry for ever: no `build` removes a row, so it reads as a live
+    /// component to whoever lists the registry, and its marks are never pruned. Retiring it
+    /// takes the row, with the version it recorded, and every mark written for the name at
+    /// any version. The projection's own view is yours to drop: a retirement is a cleanup of
+    /// what the library keeps, like [`delete_streams`](Self::delete_streams).
+    ///
+    /// Idempotent: a name the registry holds no row for returns `version: None` and deletes
+    /// whatever marks it finds, so it can run at every startup of the release that dropped
+    /// the registration. A name this store registers is refused with
+    /// [`replay::ErrorKind::InvalidInput`], and nothing is changed: retire it from a store
+    /// that no longer registers it, or drop the registration first.
+    ///
+    /// It waits for a `build` or a catch-up of this projection in any process, so neither
+    /// writes the row or a mark after it. The wait is bounded by the stream lock wait
+    /// (`stream_lock_wait` on the [builder](PostgresEventStore::builder)), and one that runs
+    /// out is [`replay::ErrorKind::Unavailable`], to be retried.
+    ///
+    /// **Call it once every process runs the release that dropped the registration.** A
+    /// replica of the previous release that is *running* is unharmed: it keeps appending,
+    /// since a mark needs no row, and its catch-up finds no row and does nothing. One that
+    /// *restarts* after the retirement registers the projection again as a first
+    /// registration: it runs `init` and replays the whole history into the view as it
+    /// stands, with no `reset` — a view that adds up is doubled, one with a unique key fails
+    /// to start. Retire after the rollout; and since the call is idempotent, run it again if
+    /// a restart did slip in: that takes the row back, with the marks the previous release's
+    /// appends left.
+    pub async fn retire_projection(&self, name: &str) -> Result<RetiredProjection, replay::Error> {
+        const OPERATION: &str = "retire_projection";
+
+        if self.projections.iter().any(|p| p.name == name) {
+            return Err(replay::Error::invalid_input(format!(
+                "inline projection `{name}` is registered on this store: retire it from a \
+                 store that does not register it"
+            ))
+            .with_operation(OPERATION)
+            .with_context("projection", name.to_string()));
+        }
+
+        let failed = |error: sqlx::Error| {
+            crate::db_error(error)
+                .with_operation(OPERATION)
+                .with_context("projection", name.to_string())
+        };
+
+        let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
+
+        // READ COMMITTED whatever the connection's default: the row and the marks are read
+        // after whoever held the projection's lock committed, so a build or a catch-up the
+        // retirement waited for leaves nothing behind it.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .execute(&mut *tx)
+            .await
+            .map_err(failed)?;
+        crate::lock_wait::bound(&mut tx, self.stream_lock_wait)
+            .await
+            .map_err(failed)?;
+        retirement::lock(&mut tx, name).await.map_err(|error| {
+            projection_lock_error(error, name, self.stream_lock_wait, OPERATION)
+        })?;
+
+        let applied_marks = retirement::delete_marks(&mut tx, name)
+            .await
+            .map_err(failed)?;
+        let version = retirement::delete_row(&mut tx, name)
+            .await
+            .map_err(failed)?;
+
+        tx.commit().await.map_err(failed)?;
+
+        let retired = RetiredProjection {
+            version,
+            applied_marks,
+        };
+        tracing::info!(
+            projection = %name,
+            version = ?retired.version,
+            applied_marks = retired.applied_marks,
+            "retired an inline projection from the registry"
+        );
+        Ok(retired)
     }
 
     /// One catch-up of one projection, in a transaction of its own.

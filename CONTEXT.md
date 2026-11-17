@@ -599,6 +599,16 @@ or rebuilt by a release that does not know it — is **adopted**: the log is tak
 stands, not replayed.
 _Avoid_: checkpoint, high-water mark, offset.
 
+### Retire (an inline projection)
+
+Taking an [Inline projection] the code no longer registers out of the registry: its row,
+with the [Projection version] it recorded, and every applied mark written for its name.
+Done by hand, from a store that does not register it, because no `build()` removes a row;
+idempotent, so it can run at every startup of the release that dropped the registration.
+The projection's view is the application's to drop. Distinct from a [Rebuild], which keeps
+the registration and replays into it.
+_Avoid_: unregister, deregister, delete the projection, drop (that is the view's).
+
 ### WASM target
 
 `replay` supports WebAssembly. The core `es` crate and the `macros` crate are
